@@ -673,13 +673,19 @@ static int jp_pilot_connect(int *Psd, const char *device)
       }
 
       /* A connected handheld yields a new (positive) socket descriptor.
-       * On timeout libpisock returns 0 rather than PI_ERR_SOCK_TIMEOUT,
-       * and 0 is not a usable socket, so treat anything not positive as
-       * "nothing connected". */
+       * On timeout the libusb backend returns 0, but the macOS (Darwin
+       * IOKit) backend returns PI_ERR_SOCK_TIMEOUT.  Neither means the
+       * port is broken, so treat both as "nothing connected yet" and keep
+       * waiting.  pi_accept_to() has already closed the socket in the
+       * PI_ERR_SOCK_TIMEOUT case. */
       ret = pi_accept_to(sd, 0, 0, SYNC_ACCEPT_SLICE_SECS);
       if (ret > 0) {
          sd = ret;
          break;
+      }
+
+      if (ret == PI_ERR_SOCK_TIMEOUT) {
+         ret = 0;
       }
 
       if (ret < 0) {
