@@ -51,6 +51,9 @@ extern int pipe_to_parent;
 int glob_log_file_mask;
 int glob_log_stdout_mask;
 int glob_log_gui_mask;
+/* Append to the log file instead of starting a new one.  Set by the sync
+ * helper, which shares the log file with the J-Pilot that started it. */
+int glob_log_file_append = 0;
 
 extern void output_to_pane(const char *str);
 extern pid_t jpilot_master_pid;
@@ -91,19 +94,19 @@ static int jp_vlogf (int level, const char *format, va_list val) {
       return EXIT_SUCCESS;
    }
 
-   if ((!fp) && (err_count>10)) {
-      return EXIT_FAILURE;
-   }
+   /* Failing to open the log file only stops logging to the file.  This
+    * used to return early, which also silenced stdout and the GUI output
+    * pane for the rest of the session.  That happened on every first run,
+    * because the first messages are logged before ~/.jpilot exists. */
    if ((!fp) && (err_count==10)) {
       fprintf(stderr, _("Unable to open log file, giving up.\n"));
       err_count++;
-      return EXIT_FAILURE;
    }
    if ((!fp) && (err_count<10)) {
       char fullname[FILENAME_MAX];
       get_home_file_name(EPN".log", fullname, sizeof(fullname));
 
-      fp = fopen(fullname, "w");
+      fp = fopen(fullname, glob_log_file_append ? "a" : "w");
       if (!fp) {
          fprintf(stderr, _("Unable to open log file\n"));
          err_count++;

@@ -30,6 +30,14 @@
 #define SYNC_NO_FORK       0x08
 #define SYNC_RESTORE       0x10
 #define SYNC_INSTALL_USER  0x20
+/* Set in a jpilot-sync process that the GUI started to perform its sync.
+ * It does not fork, but it has a parent that can answer questions over the
+ * pipes. */
+#define SYNC_HELPER        0x40
+/* Only sync in a separate process; fail rather than sync inside the GUI
+ * process, which would freeze it while waiting for the handheld.  Used
+ * when listening for HotSync. */
+#define SYNC_BACKGROUND    0x80
 
 #define SYNC_ERROR_BIND            -10
 #define SYNC_ERROR_LISTEN          -11
@@ -54,6 +62,8 @@ struct my_sync_info {
 };
 
 int sync_once(struct my_sync_info *sync_info);
+int jp_port_trylock(int *fd);
+int jp_port_unlock(int fd);
 int sync_loop(const char *port, unsigned int flags, const int num_backups);
 
 #endif

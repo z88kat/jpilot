@@ -34,6 +34,10 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <limits.h>
+#ifdef __APPLE__
+#  include <mach-o/dyld.h>
+#endif
 #ifdef USE_FLOCK
 #  include <sys/file.h>
 #else
@@ -71,6 +75,10 @@
  * obvious problem, then going back to waiting (seconds). */
 #define SYNC_ACCEPT_SLICE_SECS 10
 
+/* How long a sync that runs inside the GUI process waits for the handheld
+ * before giving up (seconds).  The GUI cannot respond while it waits. */
+#define SYNC_IN_GUI_MAX_WAIT_SECS 30
+
 #ifndef min
 #  define min(a,b) (((a) < (b)) ? (a) : (b))
 #endif
@@ -83,10 +91,13 @@
 /******************************* Global vars **********************************/
 extern int pipe_to_parent, pipe_from_parent;
 extern pid_t glob_child_pid;
+extern pid_t jpilot_master_pid;
 
 /****************************** Prototypes ************************************/
 /* From jpilot.c for restoring sync icon after successful sync */
 extern void cb_cancel_sync(GtkWidget *widget, unsigned int flags);
+/* From jpilot.c, called once the sync child has exited */
+extern void sync_child_exited(void);
 
 static int pi_file_install_VFS(const int fd, const char *basename, const int socket, const char *vfspath, progress_func f);
 static int findVFSPath(int sd, const char *path, long *volume, char *rpath, int *rpathlen);
@@ -116,10 +127,139 @@ static void on_sync_child_exit(GPid pid, gint status, gpointer data)
     * Sync/Cancel buttons rather than trying to kill an already-dead child. */
    glob_child_pid = 0;
    cb_cancel_sync(NULL, 0);
+   sync_child_exited();
 }
 
+/* Whether a question (for example "this is a different handheld, sync
+ * anyway?") can be put to a parent GUI over the pipes.  A forked child and
+ * the sync helper have one; jpilot-sync run from a shell, and a sync that
+ * runs inside the GUI process itself, do not. */
+static int sync_can_ask_parent(unsigned int flags)
+{
+   return !(SYNC_NO_FORK & flags) || (SYNC_HELPER & flags);
+}
+
+#ifdef __APPLE__
+/* Find the jpilot-sync program that sits next to the running jpilot, so
+ * that a jpilot run from the build directory uses the jpilot-sync built
+ * with it.  Falls back to searching $PATH.  Returns a newly allocated path,
+ * or NULL. */
+static gchar *sync_find_helper(void)
+{
+   char exe_path[PATH_MAX];
+   char real_path[PATH_MAX];
+   uint32_t size = sizeof(exe_path);
+
+   if ((_NSGetExecutablePath(exe_path, &size) == 0) &&
+       (realpath(exe_path, real_path) != NULL)) {
+      gchar *dir = g_path_get_dirname(real_path);
+      gchar *candidate = g_build_filename(dir, EPN"-sync", NULL);
+
+      g_free(dir);
+      if (g_file_test(candidate, G_FILE_TEST_IS_EXECUTABLE)) {
+         return candidate;
+      }
+      g_free(candidate);
+   }
+
+   return g_find_program_in_path(EPN"-sync");
+}
+
+/*
+ * Start the sync in a separate jpilot-sync process instead of forking.
+ *
+ * On macOS a child that is forked from a process which has used
+ * CoreFoundation (GTK's Quartz backend has) must exec() before it uses
+ * CoreFoundation itself, and pilot-link's IOKit USB code does.  J-Pilot
+ * used to work around this ("bug 1924") by syncing inside the GUI process,
+ * which froze the window until the handheld connected.
+ *
+ * The helper talks to us over the same pipes and protocol a forked child
+ * uses, so the rest of the GUI does not know the difference.  The sync
+ * parameters are passed on the command line because the GUI may change
+ * the preferences again as soon as this returns (Install User does).
+ */
+static int sync_spawn_helper(struct my_sync_info *sync_info)
+{
+   gchar *helper;
+   gchar *argv[26];
+   gchar fd_out[16], fd_in[16], flags_str[16];
+   gchar user_id_str[32], pc_id_str[32], backups_str[16];
+   GError *error = NULL;
+   GPid pid;
+   int argc = 0;
+
+   helper = sync_find_helper();
+   if (!helper) {
+      jp_logf(JP_LOG_WARN, _("Unable to find %s\n"), EPN"-sync");
+      return EXIT_FAILURE;
+   }
+
+   /* The helper reads the rest of the preferences from the rc file */
+   pref_write_rc_file();
+
+   g_snprintf(fd_out, sizeof(fd_out), "%d", pipe_to_parent);
+   g_snprintf(fd_in, sizeof(fd_in), "%d", pipe_from_parent);
+   g_snprintf(flags_str, sizeof(flags_str), "%u", sync_info->flags);
+   g_snprintf(user_id_str, sizeof(user_id_str), "%ld", sync_info->userID);
+   g_snprintf(pc_id_str, sizeof(pc_id_str), "%ld", sync_info->PC_ID);
+   g_snprintf(backups_str, sizeof(backups_str), "%u", sync_info->num_backups);
+
+   argv[argc++] = helper;
+   argv[argc++] = "--helper";
+   argv[argc++] = fd_out;
+   argv[argc++] = fd_in;
+   argv[argc++] = "--flags";
+   argv[argc++] = flags_str;
+   argv[argc++] = "--port";
+   argv[argc++] = sync_info->port;
+   argv[argc++] = "--user";
+   argv[argc++] = sync_info->username;
+   argv[argc++] = "--user-id";
+   argv[argc++] = user_id_str;
+   argv[argc++] = "--pc-id";
+   argv[argc++] = pc_id_str;
+   argv[argc++] = "--backups";
+   argv[argc++] = backups_str;
+   argv[argc++] = "--profile";
+   argv[argc++] = profile_get_active()[0] ? (gchar *) profile_get_active()
+                                          : PROFILE_DEFAULT_LABEL;
+   if (glob_log_stdout_mask & JP_LOG_DEBUG) {
+      argv[argc++] = "-d";
+   }
+   argv[argc] = NULL;
+
+   jp_logf(JP_LOG_DEBUG, "starting sync helper %s\n", helper);
+
+   /* Leave the descriptors open so the helper inherits the pipe ends it
+    * was told about. */
+   if (!g_spawn_async(NULL, argv, NULL,
+                      G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_LEAVE_DESCRIPTORS_OPEN,
+                      NULL, NULL, &pid, &error)) {
+      jp_logf(JP_LOG_WARN, _("Unable to start %s: %s\n"), helper,
+              error ? error->message : "?");
+      g_clear_error(&error);
+      g_free(helper);
+      return EXIT_FAILURE;
+   }
+   g_free(helper);
+
+   glob_child_pid = pid;
+   g_child_watch_add(pid, on_sync_child_exit, NULL);
+
+   return EXIT_SUCCESS;
+}
+#endif
+
 #ifdef USE_LOCKING
+static int sync_lock_impl(int *fd, int quiet);
+
 static int sync_lock(int *fd)
+{
+   return sync_lock_impl(fd, FALSE);
+}
+
+static int sync_lock_impl(int *fd, int quiet)
 {
    pid_t pid;
    char lock_file[FILENAME_MAX];
@@ -129,7 +269,8 @@ static int sync_lock(int *fd)
    struct flock lock;
 #endif
 
-   get_home_file_name("sync_pid", lock_file, sizeof(lock_file));
+   /* Shared by all profiles: they all use the same handheld port */
+   profile_base_file_name("sync_pid", lock_file, sizeof(lock_file));
    *fd = open(lock_file, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
    if (*fd<0) {
       jp_logf(JP_LOG_WARN, _("open lock file failed\n"));
@@ -147,6 +288,10 @@ static int sync_lock(int *fd)
    if (r == -1){
       ssize_t n;
 
+      if (quiet) {
+         close(*fd);
+         return EXIT_FAILURE;
+      }
       jp_logf(JP_LOG_WARN, _("lock failed\n"));
       /* str must be cleared and terminated before atoi(): the file is
        * empty whenever the previous holder truncated it on unlock, and
@@ -190,7 +335,8 @@ static int sync_unlock(int fd)
    struct flock lock;
 #endif
 
-   get_home_file_name("sync_pid", lock_file, sizeof(lock_file));
+   /* Shared by all profiles: they all use the same handheld port */
+   profile_base_file_name("sync_pid", lock_file, sizeof(lock_file));
 
 #ifndef USE_FLOCK
    lock.l_type = F_UNLCK;
@@ -230,6 +376,28 @@ static int sync_unlock(int fd)
    return EXIT_SUCCESS;
 }
 #endif
+
+/* The lock that keeps two J-Pilot processes from using the handheld port
+ * at once, for code other than the sync (the Handheld Explorer).  Says
+ * nothing when the port is busy. */
+int jp_port_trylock(int *fd)
+{
+#ifdef USE_LOCKING
+   return sync_lock_impl(fd, TRUE);
+#else
+   *fd = -1;
+   return EXIT_SUCCESS;
+#endif
+}
+
+int jp_port_unlock(int fd)
+{
+#ifdef USE_LOCKING
+   return sync_unlock(fd);
+#else
+   return EXIT_SUCCESS;
+#endif
+}
 
 static const char *get_error_str(int error)
 {
@@ -630,9 +798,23 @@ static int jp_pilot_connect(int *Psd, const char *device)
    int sd;
    int ret;
    int logged_wait = 0;
+   int waited = 0;
+   int max_wait = 0;
+   /* A forked child or the sync helper reports to this process */
+   int has_parent_gui = (getpid() != jpilot_master_pid) &&
+                        (pipe_to_parent != STDOUT_FILENO);
+   pid_t parent_pid = getppid();
    struct  SysInfo sys_info;
 
    *Psd=0;
+
+   /* A sync running inside the GUI process blocks the GUI until the
+    * handheld connects, so do not wait forever there.  Everywhere else
+    * (forked child, jpilot-sync, the sync helper) waiting is harmless and
+    * can be cancelled. */
+   if (getpid() == jpilot_master_pid) {
+      max_wait = SYNC_IN_GUI_MAX_WAIT_SECS;
+   }
 
    /* Wait for the handheld in slices instead of forever.  Each time a slice
     * passes with nothing connecting we get a chance to look for a problem
@@ -673,13 +855,22 @@ static int jp_pilot_connect(int *Psd, const char *device)
       }
 
       /* A connected handheld yields a new (positive) socket descriptor.
-       * On timeout libpisock returns 0 rather than PI_ERR_SOCK_TIMEOUT,
-       * and 0 is not a usable socket, so treat anything not positive as
-       * "nothing connected". */
+       * On timeout the libusb backend returns 0, but the macOS (Darwin
+       * IOKit) backend returns PI_ERR_SOCK_TIMEOUT.  Neither means the
+       * port is broken, so treat both as "nothing connected yet" and keep
+       * waiting.  pi_accept_to() closes the socket when it returns an
+       * error, but not when it returns 0, so close it here then; otherwise
+       * a socket is leaked every slice. */
       ret = pi_accept_to(sd, 0, 0, SYNC_ACCEPT_SLICE_SECS);
       if (ret > 0) {
          sd = ret;
          break;
+      }
+
+      if (ret == PI_ERR_SOCK_TIMEOUT) {
+         ret = 0;
+      } else if (ret == 0) {
+         pi_close(sd);
       }
 
       if (ret < 0) {
@@ -693,8 +884,7 @@ static int jp_pilot_connect(int *Psd, const char *device)
          return SYNC_ERROR_PI_ACCEPT;
       }
 
-      /* Timed out with no handheld.  pi_accept_to() has closed the socket
-       * for us, so do not close it again here.
+      /* Timed out with no handheld; the socket has been closed.
        *
        * Check the bus after every slice, not just the first: the handheld
        * only appears there once HotSync is pressed, which may well be
@@ -730,6 +920,22 @@ static int jp_pilot_connect(int *Psd, const char *device)
             jp_logf(JP_LOG_WARN, _("See %s\n"), JP_PERMISSIONS_URL);
             return SYNC_ERROR_PI_ACCEPT;
          }
+      }
+
+      /* If the GUI that started us has gone, nobody is listening to us any
+       * more, and waiting on would keep the port and the sync lock until a
+       * handheld turned up -- and then fail halfway through its sync. */
+      if (has_parent_gui && (getppid() != parent_pid)) {
+         jp_logf(JP_LOG_WARN, _("%s has exited; no longer waiting for the handheld.\n"), PN);
+         return SYNC_ERROR_PI_ACCEPT;
+      }
+
+      waited += SYNC_ACCEPT_SLICE_SECS;
+      if (max_wait && (waited >= max_wait)) {
+         jp_logf(JP_LOG_WARN,
+                 _("No handheld connected within %d seconds, giving up.\n"),
+                 waited);
+         return SYNC_ERROR_PI_ACCEPT;
       }
 
       /* Only say this once, however long the user takes to press HotSync. */
@@ -829,52 +1035,62 @@ static void move_removed_apps(GList *file_list)
    }
 }
 
-static int is_backup_dir(char *name)
+/* Backup directories are named backupYYYYMMDDhhmm.  Before 2.1.2 they were
+ * named backupMMDDhhmm, without the year.  Returns the number of digits
+ * after "backup" (12, or 8 for the old form), or 0 if name is not a backup
+ * directory. */
+static int backup_dir_digits(const char *name)
 {
    int i;
 
-   /* backup dirs are of the form backupMMDDHHMM */
    if (strncmp(name, "backup", 6)) {
-      return FALSE;
-   }
-   for (i=6; i<14; i++) {
-      if (name[i]=='\0') {
-         return FALSE;
-      }
-      if (!isdigit(name[i])) {
-         return FALSE;
-      }
-   }
-   if (name[i]!='\0') {
-      return FALSE;
-   }
-   return TRUE;
-}
-
-static int compare_back_dates(char *s1, char *s2)
-{
-   /* backupMMDDhhmm */
-   int i1, i2;
-
-   if ((strlen(s1) < 8) || (strlen(s2) < 8)) {
       return 0;
    }
-   i1 = atoi(&s1[6]);
-   i2 = atoi(&s2[6]);
-   /* Try to guess the year crossover with a 6 month window */
-   if (((i1/1000000) <= 3) && ((i2/1000000) >= 10)) {
-      return 1;
+   for (i=6; isdigit((unsigned char) name[i]); i++)
+      ;
+   if (name[i] != '\0') {
+      return 0;
    }
-   if (((i1/1000000) >= 10) && ((i2/1000000) <= 3)) {
-      return 2;
+   i -= 6;
+   return ((i == 12) || (i == 8)) ? i : 0;
+}
+
+static int is_backup_dir(char *name)
+{
+   return backup_dir_digits(name) != 0;
+}
+
+/* YYYYMMDDhhmm of a backup directory, to order backups by age.  For the old
+ * names without a year, the year is taken from when the directory was last
+ * changed, which is at or a little after the time in its name.  (Guessing
+ * the year from the month alone, as was done before, could get it wrong
+ * across a long gap between syncs, and then the newest backup was deleted
+ * as the oldest.) */
+static long long backup_dir_age(const char *home_dir, const char *name)
+{
+   char full_name[FILENAME_MAX];
+   struct stat statb;
+   struct tm *changed;
+   long long mmddhhmm, age, changed_age;
+
+   if (backup_dir_digits(name) == 12) {
+      return atoll(name + 6);
    }
-   if (i1>i2) {
-      return 1;
+
+   mmddhhmm = atoll(name + 6);
+   g_snprintf(full_name, sizeof(full_name), "%s/%s", home_dir, name);
+   if (stat(full_name, &statb) || !(changed = localtime(&statb.st_mtime))) {
+      return mmddhhmm;
    }
-   if (i1<i2) {
-      return 2;
+   changed_age = (changed->tm_year + 1900) * 100000000LL +
+                 (changed->tm_mon + 1) * 1000000LL + changed->tm_mday * 10000LL +
+                 changed->tm_hour * 100LL + changed->tm_min;
+   age = (changed->tm_year + 1900) * 100000000LL + mmddhhmm;
+   if (age > changed_age) {
+      /* Named in December, last changed in January */
+      age -= 100000000LL;
    }
-   return 0;
+   return age;
 }
 
 static int sync_remove_r(char *full_path)
@@ -913,7 +1129,7 @@ static int get_oldest_newest_dir(char *oldest, char *newest, int *count)
    DIR *dir;
    struct dirent *dirent;
    char home_dir[FILENAME_MAX];
-   int r;
+   long long oldest_age = 0, newest_age = 0;
 
    get_home_file_name("", home_dir, sizeof(home_dir));
    jp_logf(JP_LOG_DEBUG, "rotate_backups: opening dir %s\n", home_dir);
@@ -927,25 +1143,17 @@ static int get_oldest_newest_dir(char *oldest, char *newest, int *count)
    *count = 0;
    while((dirent = readdir(dir))) {
       if (is_backup_dir(dirent->d_name)) {
-         jp_logf(JP_LOG_DEBUG, "backup dir [%s]\n", dirent->d_name);
+         long long age = backup_dir_age(home_dir, dirent->d_name);
+
+         jp_logf(JP_LOG_DEBUG, "backup dir [%s] age %lld\n", dirent->d_name, age);
          (*count)++;
-         if (oldest[0]=='\0') {
+         if ((oldest[0]=='\0') || (age < oldest_age)) {
             strcpy(oldest, dirent->d_name);
-            /* jp_logf(JP_LOG_DEBUG, "oldest is now %s\n", oldest);*/
+            oldest_age = age;
          }
-         if (newest[0]=='\0') {
+         if ((newest[0]=='\0') || (age > newest_age)) {
             strcpy(newest, dirent->d_name);
-            /* jp_logf(JP_LOG_DEBUG, "newest is now %s\n", newest);*/
-         }
-         r = compare_back_dates(oldest, dirent->d_name);
-         if (r==1) {
-            strcpy(oldest, dirent->d_name);
-            /* jp_logf(JP_LOG_DEBUG, "oldest is now %s\n", oldest);*/
-         }
-         r = compare_back_dates(newest, dirent->d_name);
-         if (r==2) {
-            strcpy(newest, dirent->d_name);
-            /* jp_logf(JP_LOG_DEBUG, "newest is now %s\n", newest);*/
+            newest_age = age;
          }
       }
    }
@@ -997,8 +1205,9 @@ static int sync_rotate_backups(const int num_backups)
    time(&ltime);
    now = localtime(&ltime);
    /* Create the new backup directory */
-   g_snprintf(newdir, sizeof(newdir), "backup%02d%02d%02d%02d",
-              now->tm_mon+1, now->tm_mday, now->tm_hour, now->tm_min);
+   g_snprintf(newdir, sizeof(newdir), "backup%04d%02d%02d%02d%02d",
+              now->tm_year+1900, now->tm_mon+1, now->tm_mday, now->tm_hour, now->tm_min);
+   jp_logf(JP_LOG_GUI, _("Backing up the handheld to %s\n"), newdir);
    if (strncmp(newdir, newest, sizeof(newdir))) {
       g_snprintf(full_newdir, sizeof(full_newdir), "%s/%s", home_dir, newdir);
       if (mkdir(full_newdir, 0700)==0) {
@@ -1464,6 +1673,7 @@ static int sync_fetch(int sd, unsigned int flags,
    int main_app;
    int skip_file;
    int cardno, start;
+   int n_fetched = 0, n_unchanged = 0, n_failed = 0;
    struct DBInfo info;
    char db_copy_name[MAX_DBNAME];
    GList *file_list;
@@ -1511,6 +1721,9 @@ static int sync_fetch(int sd, unsigned int flags,
       { 0, 0, "PMNe", NULL},
       { 0, 0, "ppp_", NULL},
       { 0, 0, "u8EZ", NULL},
+      /* A status database of the Palm OS 5.2.1+ PIM applications (Tungsten
+       * T3 and later) that the handheld never lets a desktop read */
+      { 0, 0, "pdmE", "PIMsSupportStatus-pdmE"},
       { 0, 0, NULL, NULL}
    };
    unsigned int full_backup;
@@ -1721,7 +1934,10 @@ static int sync_fetch(int sd, unsigned int flags,
       /* If modification times are the same then we don't need to fetch it */
       if (info.modifyDate == statb.st_mtime) {
          jp_logf(JP_LOG_DEBUG, "%s up to date, modify date (2) %ld\n", info.name, info.modifyDate);
-         jp_logf(JP_LOG_GUI, _("%s (Creator ID '%s') is up to date, fetch skipped.\n"), db_copy_name, creator);
+         /* Only in the debug log: a backup on every sync would otherwise
+          * list every unchanged database every time */
+         jp_logf(JP_LOG_DEBUG, "%s (Creator ID '%s') is up to date, fetch skipped.\n", db_copy_name, creator);
+         n_unchanged++;
          continue;
       }
 
@@ -1739,8 +1955,10 @@ static int sync_fetch(int sd, unsigned int flags,
          jp_logf(JP_LOG_WARN, _("Failed, unable to back up database %s\n"), info.name);
          times.actime = 0;
          times.modtime = 0;
+         n_failed++;
       } else {
          jp_logf(JP_LOG_GUI, _("OK\n"));
+         n_fetched++;
          times.actime = info.createDate;
          times.modtime = info.modifyDate;
       }
@@ -1762,6 +1980,8 @@ static int sync_fetch(int sd, unsigned int flags,
       if (full_backup) {
          jp_logf(JP_LOG_DEBUG, "Removing apps not found on the palm\n");
          move_removed_apps(file_list);
+         jp_logf(JP_LOG_GUI, _("Backup finished: %d databases fetched, %d unchanged, %d failed.\n"),
+                 n_fetched, n_unchanged, n_failed);
       }
    } else {
       jp_logf(JP_LOG_WARN, "ReadDBList returned = %d\n", r);
@@ -3220,7 +3440,201 @@ static int fast_sync_application(char *DB_name, int sd)
    return EXIT_SUCCESS;
 }
 
-static int jp_install_user(const char *device, int sd, 
+/* Set when this sync moved to another profile, or detected the databases
+ * of a profile's first handheld: the profile now belongs to this handheld
+ * and its preferences have changed. */
+static int sync_saves_identity = FALSE;
+/* Set when this sync moved to another profile than the GUI has open */
+static int sync_switched_profile = FALSE;
+
+static long sync_new_pc_id(void)
+{
+   srandom(time(NULL) ^ getpid());
+   return 1 + (long) (2000000000.0 * random() / (RAND_MAX + 1.0));
+}
+
+/* Make another profile the one this sync process works in.  The handheld
+ * is already connected, so the port is not changed. */
+static void sync_switch_profile(const char *name, struct my_sync_info *sync_info)
+{
+   const char *svalue;
+   long ivalue;
+
+   profile_set_active(name);
+
+   /* A profile's rc file may leave these out or empty, and then reading it
+    * would keep the old profile's values. */
+   set_pref(PREF_USER, 0, "", FALSE);
+   set_pref(PREF_USER_ID, 0, NULL, FALSE);
+   set_pref(PREF_PC_ID, 0, NULL, FALSE);
+   set_pref(PREF_DATEBOOK_VERSION, 0, NULL, FALSE);
+   set_pref(PREF_ADDRESS_VERSION, 0, NULL, FALSE);
+   set_pref(PREF_TODO_VERSION, 0, NULL, FALSE);
+   set_pref(PREF_MEMO_VERSION, 0, NULL, FALSE);
+   pref_read_rc_file();
+
+   check_hidden_dir();
+   if (!glob_sqlite) {
+      check_copy_DBs_to_home();
+   }
+
+   get_pref(PREF_USER, NULL, &svalue);
+   g_strlcpy(sync_info->username, svalue ? svalue : "", sizeof(sync_info->username));
+   get_pref(PREF_USER_ID, &(sync_info->userID), NULL);
+   get_pref(PREF_NUM_BACKUPS, &ivalue, NULL);
+   sync_info->num_backups = ivalue;
+   get_pref(PREF_PC_ID, &(sync_info->PC_ID), NULL);
+   if (sync_info->PC_ID == 0) {
+      sync_info->PC_ID = sync_new_pc_id();
+      set_pref(PREF_PC_ID, sync_info->PC_ID, NULL, FALSE);
+   }
+
+   sync_saves_identity = TRUE;
+   sync_switched_profile = TRUE;
+   write_to_parent(PIPE_PROFILE, "\"%s\"\n", name);
+}
+
+/* For a profile's first sync: use the newer Calendar, Contacts and Memos
+ * databases if the handheld has them (Palm OS 5.2.1 and later), the
+ * classic ones otherwise.  ToDo is left alone: J-Pilot cannot read the
+ * Tasks database fully yet, and handhelds that have it keep ToDoDB up to
+ * date as well. */
+static void sync_detect_databases(int sd)
+{
+   static const struct {
+      const char *db_name;
+      int pref;
+      const char *label;
+   } newer_dbs[] = {
+      { "CalendarDB-PDat", PREF_DATEBOOK_VERSION, N_("Calendar") },
+      { "ContactsDB-PAdd", PREF_ADDRESS_VERSION,  N_("Contacts") },
+      { "MemosDB-PMem",    PREF_MEMO_VERSION,     N_("Memos") },
+   };
+   struct DBInfo info;
+   unsigned int i;
+   int r;
+
+   for (i = 0; i < sizeof(newer_dbs) / sizeof(newer_dbs[0]); i++) {
+      r = dlp_FindDBByName(sd, 0, newer_dbs[i].db_name, NULL, NULL, &info, NULL);
+      if (r >= 0) {
+         set_pref(newer_dbs[i].pref, 1, NULL, FALSE);
+         jp_logf(JP_LOG_GUI, _("This handheld uses the %s database.\n"),
+                 _(newer_dbs[i].label));
+      } else if (r == PI_ERR_DLP_PALMOS) {
+         /* Not found */
+         set_pref(newer_dbs[i].pref, 0, NULL, FALSE);
+      } else {
+         jp_logf(JP_LOG_DEBUG, "looking for %s failed (%d), keeping setting\n",
+                 newer_dbs[i].db_name, r);
+      }
+   }
+   sync_saves_identity = TRUE;
+}
+
+/*
+ * Make sure the data of the handheld that just connected goes into its own
+ * profile:
+ *  - if another profile was last synced with this handheld, switch to it;
+ *  - if the current profile belongs to a different handheld and no profile
+ *    knows this one, create a profile for it, named after its user;
+ *  - otherwise stay, and on a profile's first sync detect its databases.
+ * The handheld is identified by its user ID.
+ */
+static void sync_select_profile(int sd, struct my_sync_info *sync_info)
+{
+   struct PilotUser U;
+   char match[PROFILE_NAME_MAX + 1];
+   char new_name[PROFILE_NAME_MAX + 1];
+   const char *target = NULL;
+
+   sync_saves_identity = FALSE;
+   sync_switched_profile = FALSE;
+
+   if (getpid() == jpilot_master_pid) {
+      /* Syncing inside the GUI process; switching would pull the GUI's own
+       * preferences out from under it. */
+      return;
+   }
+   if (glob_sqlite) {
+      /* Profiles are told apart by their jpilot.rc files */
+      return;
+   }
+
+   memset(&U, 0, sizeof(U));
+   if (dlp_ReadUserInfo(sd, &U) < 0) {
+      return;
+   }
+   if (U.userID == 0) {
+      /* Left to the NULL user ID check */
+      return;
+   }
+
+   if (profile_get_auto_switch() &&
+       ((unsigned long) sync_info->userID != U.userID)) {
+      if (profile_find_by_user_id(U.userID, match, sizeof(match))) {
+         target = match;
+      } else if ((sync_info->userID != 0) || sync_info->username[0]) {
+         profile_make_unique_name(U.username, new_name, sizeof(new_name));
+         if (profile_create(new_name, profile_get_active()) == EXIT_SUCCESS) {
+            jp_logf(JP_LOG_GUI, _("New handheld \"%s\" (user ID %lu): "
+                                  "created profile \"%s\".\n"),
+                    U.username, U.userID, new_name);
+            target = new_name;
+         } else {
+            jp_logf(JP_LOG_WARN, _("Unable to create a profile for this handheld.\n"));
+         }
+      }
+   }
+
+   if (target && strcmp(target, profile_get_active())) {
+      jp_logf(JP_LOG_GUI, _("Syncing into profile \"%s\".\n"), profile_label(target));
+      sync_switch_profile(target, sync_info);
+   }
+
+   if (sync_info->userID == 0) {
+      sync_detect_databases(sd);
+   }
+
+   /* jpilot-sync run from a shell has no GUI to save who it synced with,
+    * and the next sync needs that to find this profile.  Only when this
+    * profile is the handheld's, though: otherwise the "different handheld"
+    * check below stops the sync. */
+   if ((pipe_to_parent == STDOUT_FILENO) &&
+       ((unsigned long) sync_info->userID == U.userID)) {
+      sync_saves_identity = TRUE;
+   }
+
+   if (sync_saves_identity) {
+      /* This is now the profile of this handheld */
+      g_strlcpy(sync_info->username, U.username, sizeof(sync_info->username));
+      sync_info->userID = U.userID;
+      set_pref(PREF_USER, 0, U.username, FALSE);
+      set_pref(PREF_USER_ID, U.userID, NULL, FALSE);
+
+      if (sync_switched_profile || (pipe_to_parent == STDOUT_FILENO)) {
+         /* No GUI has this profile open, so nothing else writes its rc
+          * file */
+         pref_write_rc_file();
+      } else {
+         /* The GUI has this profile open and rewrites the whole rc file
+          * whenever it saves a preference, so it must be the one to save
+          * these.  It gets the user name and ID with PIPE_USERNAME and
+          * PIPE_USERID as usual; then it reloads the profile. */
+         long datebook_version, address_version, todo_version, memo_version;
+
+         get_pref(PREF_DATEBOOK_VERSION, &datebook_version, NULL);
+         get_pref(PREF_ADDRESS_VERSION, &address_version, NULL);
+         get_pref(PREF_TODO_VERSION, &todo_version, NULL);
+         get_pref(PREF_MEMO_VERSION, &memo_version, NULL);
+         write_to_parent(PIPE_DB_VERSIONS, "%ld %ld %ld %ld\n",
+                         datebook_version, address_version,
+                         todo_version, memo_version);
+         write_to_parent(PIPE_PROFILE, "\"%s\"\n", profile_get_active());
+      }
+   }
+}
+
+static int jp_install_user(const char *device, int sd,
                            struct my_sync_info *sync_info)
 {
    struct PilotUser U;
@@ -3320,38 +3734,6 @@ static int jp_sync(struct my_sync_info *sync_info)
 
    long datebook_version, address_version, todo_version, memo_version;
 
-   /* Convert to new database names if prefs set */
-   rename_dbnames(dbname);
-
-   /* Change unpack/pack function pointers if needed */
-   get_pref(PREF_DATEBOOK_VERSION, &datebook_version, NULL);
-   get_pref(PREF_ADDRESS_VERSION, &address_version, NULL);
-   get_pref(PREF_TODO_VERSION, &todo_version, NULL);
-   get_pref(PREF_MEMO_VERSION, &memo_version, NULL);
-   if (datebook_version==0) {
-      unpack_cai_from_buf[0]=unpack_datebook_cai_from_ai;
-      pack_cai_into_buf[0]=pack_datebook_cai_into_ai;
-   }
-   if (datebook_version==1) {
-      unpack_cai_from_buf[0]=unpack_calendar_cai_from_ai;
-      pack_cai_into_buf[0]=pack_calendar_cai_into_ai;
-   }
-   if (address_version==1) {
-      unpack_cai_from_buf[1]=unpack_contact_cai_from_ai;
-      pack_cai_into_buf[1]=pack_contact_cai_into_ai;
-   }
-   if (todo_version==1) {
-      /* FIXME: Uncomment when support for Task has been added
-      unpack_cai_from_buf[2]=unpack_task_cai_from_ai;
-      pack_cai_into_buf[2]=pack_task_cai_into_ai;
-      */
-      ;
-   }
-   if (memo_version==1) {
-      /* No change necessary between Memo and Memos databases */
-      ;
-   }
-
    /* Load the plugins for a forked process */
 #ifdef ENABLE_PLUGINS
    if (!(SYNC_NO_FORK & sync_info->flags) &&
@@ -3392,10 +3774,16 @@ static int jp_sync(struct my_sync_info *sync_info)
       }
    }
 
-   jp_logf(JP_LOG_GUI, "****************************************\n");
-   jp_logf(JP_LOG_GUI, _(" Syncing on device %s\n"), device);
-   jp_logf(JP_LOG_GUI, _(" Press the HotSync button now\n"));
-   jp_logf(JP_LOG_GUI, "****************************************\n");
+   if (SYNC_BACKGROUND & sync_info->flags) {
+      /* Listening for HotSync: this is printed after every sync, so keep
+       * it short and leave the previous sync's messages in view */
+      jp_logf(JP_LOG_GUI, _("Waiting for HotSync on %s...\n"), device);
+   } else {
+      jp_logf(JP_LOG_GUI, "****************************************\n");
+      jp_logf(JP_LOG_GUI, _(" Syncing on device %s\n"), device);
+      jp_logf(JP_LOG_GUI, _(" Press the HotSync button now\n"));
+      jp_logf(JP_LOG_GUI, "****************************************\n");
+   }
 
    ret = jp_pilot_connect(&sd, device);
    if (ret) {
@@ -3407,6 +3795,57 @@ static int jp_sync(struct my_sync_info *sync_info)
       write_to_parent(PIPE_FINISHED, "\n");
       return ret;
    }
+
+   /* Tell the GUI a handheld is connected: a sync is now under way and
+    * must not be interrupted */
+   write_to_parent(PIPE_CONNECTED, "\n");
+
+   /* Sync into the profile of the handheld that connected.  This can
+    * change the preferences, so the database names are chosen after it. */
+   if (!(SYNC_RESTORE & sync_info->flags)) {
+      long backup_on_sync;
+
+      sync_select_profile(sd, sync_info);
+
+      /* The profile synced into may want a backup with every sync */
+      get_pref(PREF_BACKUP_ON_SYNC, &backup_on_sync, NULL);
+      if (backup_on_sync && !(SYNC_FULL_BACKUP & sync_info->flags)) {
+         sync_info->flags |= SYNC_FULL_BACKUP;
+      }
+   }
+
+   /* Convert to new database names if prefs set */
+   rename_dbnames(dbname);
+
+   /* Change unpack/pack function pointers if needed */
+   get_pref(PREF_DATEBOOK_VERSION, &datebook_version, NULL);
+   get_pref(PREF_ADDRESS_VERSION, &address_version, NULL);
+   get_pref(PREF_TODO_VERSION, &todo_version, NULL);
+   get_pref(PREF_MEMO_VERSION, &memo_version, NULL);
+   if (datebook_version==0) {
+      unpack_cai_from_buf[0]=unpack_datebook_cai_from_ai;
+      pack_cai_into_buf[0]=pack_datebook_cai_into_ai;
+   }
+   if (datebook_version==1) {
+      unpack_cai_from_buf[0]=unpack_calendar_cai_from_ai;
+      pack_cai_into_buf[0]=pack_calendar_cai_into_ai;
+   }
+   if (address_version==1) {
+      unpack_cai_from_buf[1]=unpack_contact_cai_from_ai;
+      pack_cai_into_buf[1]=pack_contact_cai_into_ai;
+   }
+   if (todo_version==1) {
+      /* FIXME: Uncomment when support for Task has been added
+      unpack_cai_from_buf[2]=unpack_task_cai_from_ai;
+      pack_cai_into_buf[2]=pack_task_cai_into_ai;
+      */
+      ;
+   }
+   if (memo_version==1) {
+      /* No change necessary between Memo and Memos databases */
+      ;
+   }
+
 
    /* The connection has been established here */
    /* Plugins should call pi_watchdog(); if they are going to be a while */
@@ -3441,7 +3880,7 @@ static int jp_sync(struct my_sync_info *sync_info)
       jp_logf(JP_LOG_GUI, _(" This Username-->\"%s\"\n"), U.username);
       jp_logf(JP_LOG_GUI, _(" This User ID-->%d\n"), U.userID);
 
-      if (SYNC_NO_FORK & sync_info->flags) {
+      if (!sync_can_ask_parent(sync_info->flags)) {
          return SYNC_ERROR_NULL_USERID;
       } else {
          write_to_parent(PIPE_WAITING_ON_USER, "%d:\n", SYNC_ERROR_NULL_USERID);
@@ -3463,7 +3902,7 @@ static int jp_sync(struct my_sync_info *sync_info)
       jp_logf(JP_LOG_GUI, _(" This Username-->\"%s\"\n"), U.username);
       jp_logf(JP_LOG_GUI, _(" This User ID-->%d\n"), U.userID);
 
-      if (SYNC_NO_FORK & sync_info->flags) {
+      if (!sync_can_ask_parent(sync_info->flags)) {
          return SYNC_ERROR_NOT_SAME_USERID;
       } else {
          write_to_parent(PIPE_WAITING_ON_USER, "%d:\n", SYNC_ERROR_NOT_SAME_USERID);
@@ -3483,10 +3922,10 @@ static int jp_sync(struct my_sync_info *sync_info)
       jp_logf(JP_LOG_GUI, _("Last Synced UserID-->\"%d\"\n"), sync_info->userID);
       jp_logf(JP_LOG_GUI, _(" This Username-->\"%s\"\n"), U.username);
       jp_logf(JP_LOG_GUI, _(" This User ID-->%d\n"), U.userID);
-      write_to_parent(PIPE_WAITING_ON_USER, "%d:\n", SYNC_ERROR_NOT_SAME_USER);
-      if (SYNC_NO_FORK & sync_info->flags) {
+      if (!sync_can_ask_parent(sync_info->flags)) {
          return SYNC_ERROR_NOT_SAME_USER;
       } else {
+         write_to_parent(PIPE_WAITING_ON_USER, "%d:\n", SYNC_ERROR_NOT_SAME_USER);
          ret = wait_for_response(sd);
       }
 
@@ -3716,11 +4155,6 @@ int sync_once(struct my_sync_info *sync_info)
    struct my_sync_info sync_info_copy;
    pid_t pid;
 
-#ifdef __APPLE__
-   /* bug 1924 */
-   sync_info->flags |= SYNC_NO_FORK;
-#endif
-
    /* This should never be reached with new cancel sync code
     * Although, it can be reached through a remote sync. */
    if (glob_child_pid) {
@@ -3730,6 +4164,22 @@ int sync_once(struct my_sync_info *sync_info)
                              "         or stop the sync by typing \"kill %d\" at the command line\n"), PN, glob_child_pid);
       return EXIT_FAILURE;
    }
+
+#ifdef __APPLE__
+   /* A forked child cannot use the macOS USB code (bug 1924), so run the
+    * sync in a helper process.  If that is not possible, sync inside this
+    * process as J-Pilot used to; the GUI is unresponsive while it does. */
+   if (!(SYNC_NO_FORK & sync_info->flags)) {
+      if (sync_spawn_helper(sync_info) == EXIT_SUCCESS) {
+         return EXIT_SUCCESS;
+      }
+      if (SYNC_BACKGROUND & sync_info->flags) {
+         return EXIT_FAILURE;
+      }
+      jp_logf(JP_LOG_WARN, _("Syncing inside %s instead; it will not respond until the sync is finished.\n"), PN);
+      sync_info->flags |= SYNC_NO_FORK;
+   }
+#endif
 
    /* Make a copy of the sync info for the forked process */
    memcpy(&sync_info_copy, sync_info, sizeof(struct my_sync_info));

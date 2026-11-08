@@ -58,6 +58,10 @@ jpilot_SOURCES = \
 	japanese.c \
 	japanese.h \
 	jpilot.c \
+	explorer.c \
+	explorer.h \
+	profile_gui.c \
+	profile_gui.h \
 	jpilot.h \
 	jp-contact.c \
 	jp-pi-contact.h \
@@ -101,6 +105,8 @@ jpilot_SOURCES = \
 	todo.c \
 	todo_gui.c \
 	todo.h \
+	profile.c \
+	profile.h \
 	utils.c \
 	utils.h \
 	weekview_gui.c \
@@ -137,6 +143,8 @@ jpilot_dump_SOURCES = \
 	prefs.c \
 	russian.c \
 	todo.c \
+	profile.c \
+	profile.h \
 	utils.c \
 	jp-contact.c
 
@@ -157,6 +165,8 @@ jpilot_sync_SOURCES = \
 	prefs.c \
 	russian.c \
 	sync.c \
+	profile.c \
+	profile.h \
 	utils.c \
 	jp-contact.c
 
@@ -175,6 +185,8 @@ jpilot_merge_SOURCES = \
 	plugins.c \
 	prefs.c \
 	russian.c \
+	profile.c \
+	profile.h \
 	utils.c
 
 

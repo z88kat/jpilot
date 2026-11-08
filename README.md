@@ -131,22 +131,42 @@ type it in.  Command-line pilot-link tools accept it the same way:
 pilot-xfer -p /dev/pilot -l
 ```
 
-### Environment variables
-J-Pilot uses the JPILOT_HOME environment variable to make it easy to allow multiple pilots to be synced under the same unix user.  Just set JPILOT_HOME to the directory you want jpilot to use.  For example, I have 2 palm pilots.  I can sync the one I use all the time into /home/judd.  The other one I can sync into /home/judd/palm2 by using this script:
-```shell
-#!/bin/bash
-JPILOT_HOME=/home/judd/palm2
-jpilot
-```
+### Profiles: more than one handheld
+Each handheld can have its own profile: a complete set of J-Pilot data (databases, settings, backups).  The default profile is `~/.jpilot` itself, so nothing changes until you make another one.  Other profiles live in `~/.jpilot/profiles/<name>/`.
+
+- **File -> Profiles...** lists the profiles and the handheld each one was last synced with, and creates, opens, renames and deletes them (delete moves the profile to the Trash).  The window title shows the open profile.
+- `jpilot --profile "Tungsten C"` and `jpilot-sync --profile "Tungsten C"` open a profile, creating it if needed.  Without `--profile`, the last profile used is opened.  `--profile Default` is `~/.jpilot`.
+- When a handheld syncs, its data goes into the profile last synced with it, whichever profile is open, and J-Pilot then opens that profile.  A handheld no profile knows yet goes into the open profile if that has never been synced, otherwise into a new profile named after the handheld's user.  This can be turned off in the Profiles window.
+- On a profile's first sync, J-Pilot checks whether the handheld uses the newer Calendar, Contacts and Memos databases (Palm OS 5.2.1 and later, e.g. the Tungsten T3) and sets the profile up to match.
+
+To give a new handheld a name of your choosing, create the profile and open it before the handheld's first sync.
+
+The JPILOT_HOME environment variable still works: it moves the whole of `.jpilot`, profiles included, to another directory.
+
 ### Syncing
-Some users find that timing matters for getting the Palm to start syncing.  It seems to succedd more often by pressing the sync button on the PalmOS device and then within a second or two pressing the sync button in jpilot.
+Normally a sync takes two presses: Sync in J-Pilot, then the HotSync button on the handheld.
+
+With **File -> Listen for HotSync** turned on, J-Pilot is always waiting for a handheld, so pressing HotSync on the handheld is enough.  Together with profiles, each handheld then syncs into its own profile by itself.  Cancel stops listening.  The setting is kept in `~/.jpilot/profiles.ini`.
+
+On macOS the sync runs in a separate `jpilot-sync` process, so J-Pilot stays responsive while it waits for the handheld.
+
+### Handheld Explorer
+**File -> Handheld Explorer...** opens a window for looking at what is on the handheld and moving things on and off it, without syncing.  Press HotSync on the handheld to connect; the connection stays open until you click Disconnect or close the window.
+
+- **Internal memory** lists the databases and applications with their type, creator, size, number of records and date, and shows the free memory.  *Copy to Computer* saves them as `.pdb`/`.prc`/`.pqa` files.  Databases that just hold a file are saved as that file: the Photos application keeps each picture as one, so `3.jpg` comes out as a real JPEG.  *Copy to Handheld* installs `.prc`, `.pdb` and `.pqa` files.  *Delete* removes databases from the handheld; take care with the ones the handheld itself uses.
+- **Memory cards** (Palm OS 4 and later) can be browsed folder by folder.  Files and whole folders can be copied to the computer, files copied into the current folder of the card, folders made, and files and folders deleted.
+
+Files copied to the computer never replace files already there, and keep the dates they have on the handheld.  While the explorer is open, listening for HotSync is paused.  Always end with Disconnect (or by closing the window or J-Pilot): a handheld whose connection disappears without that may hang on its sync screen until it is reset.
 
 ### BACKUP and SYNC
-Just a warning that a sync DOES NOT backup your palm.  
-The Sync button will sync the 4 applications with the palm pilot and any plugins that are installed.  
-  
-The Backup button will backup every program and database from the palm pilot, except for AvantGo files (these are usually big and change daily).  
-  
+The Sync button syncs the 4 applications with the palm pilot and any plugins that are installed.  By default a sync DOES NOT back up your palm.
+
+The Backup button syncs and then backs up every program and database from the palm pilot, except for AvantGo files (these are usually big and change daily).
+
+To back up on every sync, turn on **Back up the handheld on every sync** in File -> Preferences -> Settings.  It is a setting of the profile, so it applies whichever way the sync starts (the Sync button, listening for HotSync, or jpilot-sync).  Backups are incremental: each one starts as a copy of the previous one and only fetches the databases that changed, so after the first one they are quick.
+
+Backups are kept in the profile's directory as `backupYYYYMMDDhhmm`, with `backup` pointing at the newest; "Number of backups to be archived" in the same preferences tab says how many are kept.  Databases that have been deleted from the handheld are moved to `backup_removed`.  File -> Restore Handheld restores the newest backup.
+
 If you get an error saying that you have a NULL user ID, then you need to run install-user from the pilot-link suite.  On Debian and Ubuntu it is installed as `pilot-install-user`.
 ```shell
 pilot-install-user -p usb: -u "Judd" -i 12345

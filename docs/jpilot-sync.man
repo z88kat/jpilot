@@ -3,7 +3,7 @@
 jpilot-sync \- A command line tool for syncing jpilot databases to a Palm OS
 device.
 .SH SYNOPSIS
-.B jpilot-sync [-v] [-h] [-d] [-P] [-b] [-l] [-p port] 
+.B jpilot-sync [-v] [-h] [-d] [-P] [-b] [-l] [-p port] [--profile name]
 .SH "DESCRIPTION"
 J-Pilot preferences are read to get port, rate, number of backups, etc.
 They are read from the directory
@@ -31,6 +31,12 @@ Stay in a loop, otherwise sync once and exit.
 .BI "\-p " port
 Use this port to sync with instead of using preferences or the
 default of /dev/jpilot.
+.TP
+.BI "\-\-profile " name
+Sync into this profile, creating it if it does not exist.  Without this
+option the profile J-Pilot used last is synced.  A handheld that was last
+synced into another profile is synced into that profile instead, unless
+this has been turned off in J-Pilot's Profiles window.
 .SH BUGS
 See @DOCDIR@/BUGS
 .SH SEE ALSO

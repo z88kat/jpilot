@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
+#include <errno.h>
 #include <ctype.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -51,6 +52,8 @@
 #include "datebook.h"
 #include "address.h"
 #include "install_user.h"
+#include "profile_gui.h"
+#include "explorer.h"
 #include "todo.h"
 #include "memo.h"
 #include "sync.h"
@@ -103,6 +106,34 @@ gint glob_date_timer_tag;
 pid_t glob_child_pid;
 pid_t jpilot_master_pid;
 int plugin_number = DATEBOOK + 100;
+
+/* The command line, without --profile, for restarting into a profile */
+static char **restart_argv = NULL;
+/* Profile to restart into once J-Pilot has shut down, if any */
+static gchar *restart_profile = NULL;
+/* A sync moved to, or changed the settings of, this profile (PIPE_PROFILE) */
+static gchar *sync_profile = NULL;
+/* The sync child has a handheld connected (PIPE_CONNECTED) */
+static int sync_connected = FALSE;
+
+/* Listening for HotSync: a sync is kept waiting for a handheld at all
+ * times, so pressing HotSync on the handheld is enough. */
+#define LISTEN_RESTART_SECS     2  /* pause before waiting again */
+#define LISTEN_QUICK_EXIT_SECS  5  /* a wait shorter than this failed to start */
+#define LISTEN_MAX_QUICK_EXITS  5  /* stop listening after this many in a row */
+static int listening = FALSE;
+static GtkWidget *menu_listen = NULL;
+/* Set while the code itself changes the menu item, so that its "toggled"
+ * handler does not take it for the user's choice */
+static int listen_menu_updating = FALSE;
+static guint listen_timer = 0;
+static time_t listen_started = 0;
+static int listen_quick_exits = 0;
+/* Listening is paused while the Handheld Explorer uses the port */
+static int listen_paused = FALSE;
+/* A Sync or Backup the user asked for while a sync was waiting */
+static int pending_sync = FALSE;
+static unsigned int pending_sync_flags = 0;
 /* jpilot.c file globals */
 static GtkWidget *g_hbox, *g_vbox0;
 static GtkWidget *g_hbox2, *g_vbox0_1;
@@ -651,9 +682,148 @@ static void sync_sig_handler(int sig) {
     }
 }
 
+static void start_sync(unsigned int flags) {
+    int r;
+
+    listen_started = time(NULL);
+    r = setup_sync(flags);
+
+    /* Fork successful, child sync process started */
+    if (glob_child_pid && (r == EXIT_SUCCESS)) {
+        gtk_widget_hide(button_sync);
+        gtk_widget_show(button_cancel_sync);
+    }
+}
+
+static void set_listening(int on, int save);
+
+static gboolean cb_listen_start(gpointer data) {
+    listen_timer = 0;
+    if (!listening || listen_paused || glob_child_pid || restart_profile) {
+        return FALSE;
+    }
+    start_sync((skip_plugins ? SYNC_NO_PLUGINS : 0) | SYNC_BACKGROUND);
+    if (!glob_child_pid) {
+        jp_logf(JP_LOG_WARN, _("Unable to listen for HotSync: the sync could not be started in the background.\n"));
+        set_listening(FALSE, FALSE);
+    }
+    return FALSE;
+}
+
+static void listen_schedule(int secs) {
+    if (!listen_timer) {
+        listen_timer = g_timeout_add_seconds(secs, cb_listen_start, NULL);
+    }
+}
+
+/* Start or stop listening for HotSync.  save makes it the setting for
+ * the next time J-Pilot starts. */
+static void set_listening(int on, int save) {
+    if (save) {
+        profile_set_listen(on);
+    }
+    if (menu_listen &&
+        (gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(menu_listen)) != on)) {
+        listen_menu_updating = TRUE;
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(menu_listen), on);
+        listen_menu_updating = FALSE;
+    }
+    if (listening == on) {
+        return;
+    }
+    listening = on;
+
+    if (on) {
+        listen_quick_exits = 0;
+        jp_logf(JP_LOG_GUI, _("Listening for HotSync: press HotSync on a handheld at any time.\n"));
+        if (!glob_child_pid) {
+            listen_schedule(0);
+        }
+    } else {
+        if (listen_timer) {
+            g_source_remove(listen_timer);
+            listen_timer = 0;
+        }
+        /* Stop a sync that is only waiting; let one under way finish */
+        if (glob_child_pid && !sync_connected) {
+            kill(glob_child_pid, SIGTERM);
+        }
+        if (save) {
+            jp_logf(JP_LOG_GUI, _("Stopped listening for HotSync.\n"));
+        }
+    }
+}
+
+/* Whether a sync has a handheld connected */
+int jpilot_sync_connected(void) {
+    return glob_child_pid && sync_connected;
+}
+
+/* The Handheld Explorer is about to use the port: stop a sync that is only
+ * waiting for a handheld, and do not start waiting again until
+ * jpilot_listen_resume(). */
+void jpilot_listen_pause(void) {
+    listen_paused = TRUE;
+    pending_sync = FALSE;
+    if (listen_timer) {
+        g_source_remove(listen_timer);
+        listen_timer = 0;
+    }
+    if (glob_child_pid && !sync_connected) {
+        kill(glob_child_pid, SIGTERM);
+    }
+}
+
+void jpilot_listen_resume(void) {
+    listen_paused = FALSE;
+    if (listening && !glob_child_pid) {
+        listen_schedule(1);
+    }
+}
+
+static void cb_listen_toggled(GtkCheckMenuItem *item, gpointer data) {
+    if (listen_menu_updating) {
+        return;
+    }
+    set_listening(gtk_check_menu_item_get_active(item), TRUE);
+}
+
+/* After a sync process has gone: run the sync the user asked for while it
+ * was waiting, or wait for the next HotSync */
+static void listen_after_sync(int was_connected) {
+    if (listen_paused) {
+        return;
+    }
+    if (pending_sync) {
+        pending_sync = FALSE;
+        start_sync(pending_sync_flags);
+        return;
+    }
+    if (!listening) {
+        return;
+    }
+    if (!was_connected && (time(NULL) - listen_started < LISTEN_QUICK_EXIT_SECS)) {
+        int delay;
+
+        /* For example, the port is busy: a J-Pilot that was force quit
+         * leaves its sync waiting for up to 10 seconds.  Back off (4, 8,
+         * 16, 32 seconds) before giving up. */
+        if (++listen_quick_exits >= LISTEN_MAX_QUICK_EXITS) {
+            jp_logf(JP_LOG_WARN, _("Stopped listening for HotSync: the sync keeps stopping before a handheld connects.\n"));
+            set_listening(FALSE, FALSE);
+            return;
+        }
+        delay = LISTEN_RESTART_SECS << listen_quick_exits;
+        jp_logf(JP_LOG_GUI, _("The sync stopped before a handheld connected; listening again in %d seconds.\n"), delay);
+        listen_schedule(delay);
+        return;
+    }
+    listen_quick_exits = 0;
+    listen_schedule(LISTEN_RESTART_SECS);
+}
+
 static void cb_sync(GtkWidget *widget, unsigned int flags) {
     long ivalue;
-    int r;
 
     /* confirm file installation */
     get_pref(PREF_CONFIRM_FILE_INSTALL, &ivalue, NULL);
@@ -673,14 +843,15 @@ static void cb_sync(GtkWidget *widget, unsigned int flags) {
         }
     }
 
-    r = setup_sync(flags);
-
-    /* Fork successful, child sync process started */
-    if (glob_child_pid && (r == EXIT_SUCCESS)) {
-        gtk_widget_hide(button_sync);
-        gtk_widget_show(button_cancel_sync);
+    if (glob_child_pid && listening && !sync_connected) {
+        /* Replace the sync waiting for HotSync with the one asked for */
+        pending_sync = TRUE;
+        pending_sync_flags = flags;
+        kill(glob_child_pid, SIGTERM);
+        return;
     }
 
+    start_sync(flags);
 }
 
 void cb_cancel_sync(GtkWidget *widget, unsigned int flags);
@@ -697,6 +868,13 @@ static const char *getWebMenuXmlString();
 
 
 void cb_cancel_sync(GtkWidget *widget, unsigned int flags) {
+    /* widget is NULL when called to reset the buttons after a sync */
+    if (widget && listening) {
+        set_listening(FALSE, TRUE);
+    }
+    if (widget) {
+        pending_sync = FALSE;
+    }
     if (glob_child_pid) {
         jp_logf(JP_LOG_GUI, "****************************************\n");
         jp_logf(JP_LOG_GUI, _(" Cancelling HotSync\n"));
@@ -764,13 +942,34 @@ void output_to_pane(const char *str) {
         ivalue = size_requisition.height + 1;
         set_pref(PREF_OUTPUT_HEIGHT, ivalue, NULL, TRUE);
     }
-    //w = gdk_window_get_width(gtk_widget_get_window(window));
-    /* window may not be realized yet if a message is logged during GUI
+    /* Show at least ivalue pixels of output.  The view above the pane does
+     * not shrink below its minimum height, and with larger themes (macOS)
+     * that can be the whole window, which left the pane 1 pixel high.  Then
+     * make the window taller instead.  A pane the user has made larger is
+     * left alone.
+     * The window may not be realized yet if a message is logged during GUI
      * construction (before gtk_widget_show_all); get_window() is NULL then. */
-    h = gtk_widget_get_window(window) ?
-        gdk_window_get_height(gtk_widget_get_window(window)) : 0;
-    new_y = h - ivalue;
-    gtk_paned_set_position(GTK_PANED(output_pane), new_y);
+    if (gtk_widget_get_window(window)) {
+        GtkWidget *top = gtk_paned_get_child1(GTK_PANED(output_pane));
+        int top_min = 0;
+
+        gtk_widget_get_preferred_height(top, &top_min, NULL);
+        h = gtk_widget_get_allocated_height(output_pane);
+        if (h <= 1) {
+            h = gdk_window_get_height(gtk_widget_get_window(window));
+        }
+        if (h - gtk_paned_get_position(GTK_PANED(output_pane)) < ivalue) {
+            if (h - top_min < ivalue) {
+                int win_w, win_h, grow = ivalue - (h - top_min);
+
+                gtk_window_get_size(GTK_WINDOW(window), &win_w, &win_h);
+                gtk_window_resize(GTK_WINDOW(window), win_w, win_h + grow);
+                h += grow;
+            }
+            new_y = h - ivalue;
+            gtk_paned_set_position(GTK_PANED(output_pane), new_y);
+        }
+    }
 
     /* Output text to window */
     GtkTextIter end_iter;
@@ -816,6 +1015,84 @@ void output_to_pane(const char *str) {
 }
 
 
+/* Whether the sync under way works in another profile than this one; its
+ * user name, ID and password then belong to that profile, which the sync
+ * process saves itself. */
+static int sync_is_for_other_profile(void) {
+    return sync_profile && strcmp(sync_profile, profile_get_active());
+}
+
+static gboolean cb_restart_into_profile(gpointer data) {
+    /* Shut down as if the window was closed; main() then restarts */
+    cb_delete_event(window, NULL, NULL);
+    return FALSE;
+}
+
+/* Called once the sync process has gone (or, when syncing inside this
+ * process, once it has finished). */
+void sync_child_exited(void) {
+    int was_connected = sync_connected;
+
+    sync_connected = FALSE;
+
+    if (sync_profile) {
+        if (strcmp(sync_profile, profile_get_active())) {
+            jp_logf(JP_LOG_GUI, _("Opening profile \"%s\"...\n"), profile_label(sync_profile));
+        } else {
+            jp_logf(JP_LOG_GUI, _("Reloading the profile's new settings...\n"));
+        }
+        g_free(restart_profile);
+        restart_profile = sync_profile;
+        sync_profile = NULL;
+        g_idle_add(cb_restart_into_profile, NULL);
+        return;
+    }
+
+    listen_after_sync(was_connected);
+}
+
+/* Replace this process with J-Pilot running restart_profile */
+static void restart_into_profile(void) {
+    GPtrArray *args = g_ptr_array_new();
+    int i;
+
+    for (i = 0; restart_argv && restart_argv[i]; i++) {
+        g_ptr_array_add(args, restart_argv[i]);
+    }
+    g_ptr_array_add(args, "--profile");
+    g_ptr_array_add(args, restart_profile[0] ? restart_profile : PROFILE_DEFAULT_LABEL);
+    g_ptr_array_add(args, NULL);
+
+    execvp((char *) args->pdata[0], (char **) args->pdata);
+    fprintf(stderr, _("Unable to restart %s: %s\n"), PN, strerror(errno));
+    g_ptr_array_free(args, TRUE);
+}
+
+/* "J-Pilot 2.1.1 User: name", followed by the profile unless it is the
+ * default one */
+static void build_window_title(char *title, size_t size) {
+    long char_set;
+    const char *svalue;
+
+    get_pref(PREF_CHAR_SET, &char_set, NULL);
+    get_pref(PREF_USER, NULL, &svalue);
+
+    g_strlcpy(title, PN" "VERSION, size);
+    if ((svalue) && (svalue[0])) {
+        /* Convert user name so that it can be displayed in window title */
+        /* We assume user name is coded in jpilot.rc as it is on the Palm Pilot */
+        char *user_name = charset_p2newj(svalue, -1, char_set);
+
+        g_strlcat(title, _(" User: "), size);
+        g_strlcat(title, user_name, size);
+        free(user_name);
+    }
+    if (profile_get_active()[0]) {
+        g_strlcat(title, _("   Profile: "), size);
+        g_strlcat(title, profile_get_active(), size);
+    }
+}
+
 const char * pipe_command_to_text(int command) {
     switch (command) {
     case PIPE_PRINT:
@@ -830,6 +1107,12 @@ const char * pipe_command_to_text(int command) {
         return "WAITING_ON_USER";
     case PIPE_FINISHED:
         return "FINISHED";
+    case PIPE_PROFILE:
+        return "PROFILE";
+    case PIPE_CONNECTED:
+        return "CONNECTED";
+    case PIPE_DB_VERSIONS:
+        return "DB_VERSIONS";
     default:
         return "UNKNOWN";
     }
@@ -852,10 +1135,7 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
     int command;
     char user[MAX_PREF_LEN];
     char command_str[80];
-    long char_set;
-    const char *svalue;
     char title[MAX_PREF_LEN + 256];
-    char *user_name;
     gint in = g_io_channel_unix_get_fd(channel);
     const char *cmd_str;
 
@@ -925,6 +1205,10 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
                     output_to_pane(Pstr1);
                     break;
                 case PIPE_USERID:
+                    if (sync_is_for_other_profile()) {
+                        /* The sync process saved it in its profile */
+                        break;
+                    }
                     /* Save user ID as pref */
                     num = sscanf(Pstr1, "%lu", &user_id);
                     if (num > 0) {
@@ -935,6 +1219,9 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
                     }
                     break;
                 case PIPE_USERNAME:
+                    if (sync_is_for_other_profile()) {
+                        break;
+                    }
                     /* Save username as pref */
                     Pstr2 = strchr(Pstr1, '\"');
                     if (Pstr2) {
@@ -952,6 +1239,9 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
                     }
                     break;
                 case PIPE_PASSWORD:
+                    if (sync_is_for_other_profile()) {
+                        break;
+                    }
                     /* Save password as pref */
                     Pstr2 = strchr(Pstr1, '\"');
                     if (Pstr2) {
@@ -995,18 +1285,40 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
                         fsync(pipe_to_child);
                     }
                     break;
-                case PIPE_FINISHED:
-                    /* Update main window title as user name may have changed */
-                    get_pref(PREF_CHAR_SET, &char_set, NULL);
-                    get_pref(PREF_USER, NULL, &svalue);
-                    strcpy(title, PN" "VERSION);
-                    if ((svalue) && (svalue[0])) {
-                        strcat(title, _(" User: "));
-                        user_name = charset_p2newj(svalue, -1, char_set);
-                        strcat(title, user_name);
-                        gtk_window_set_title(GTK_WINDOW(window), title);
-                        free(user_name);
+                case PIPE_CONNECTED:
+                    sync_connected = TRUE;
+                    break;
+                case PIPE_DB_VERSIONS: {
+                    long versions[4];
+
+                    /* The databases of this profile's first handheld */
+                    if (sscanf(Pstr1, "%ld %ld %ld %ld", &versions[0], &versions[1],
+                               &versions[2], &versions[3]) == 4) {
+                        set_pref(PREF_DATEBOOK_VERSION, versions[0], NULL, FALSE);
+                        set_pref(PREF_ADDRESS_VERSION, versions[1], NULL, FALSE);
+                        set_pref(PREF_TODO_VERSION, versions[2], NULL, FALSE);
+                        set_pref(PREF_MEMO_VERSION, versions[3], NULL, TRUE);
                     }
+                    break;
+                }
+                case PIPE_PROFILE:
+                    Pstr2 = strchr(Pstr1, '\"');
+                    Pstr3 = Pstr2 ? strchr(Pstr2 + 1, '\"') : NULL;
+                    if (Pstr3) {
+                        g_free(sync_profile);
+                        sync_profile = g_strndup(Pstr2 + 1, Pstr3 - Pstr2 - 1);
+                    }
+                    break;
+                case PIPE_FINISHED:
+                    if (sync_profile && !glob_child_pid) {
+                        /* Synced inside this process; there is no child
+                         * exit to wait for */
+                        sync_child_exited();
+                        break;
+                    }
+                    /* Update main window title as user name may have changed */
+                    build_window_title(title, sizeof(title));
+                    gtk_window_set_title(GTK_WINDOW(window), title);
                     /* And redraw GUI */
                     if (Pstr1) {
                         cb_app_button(NULL, GINT_TO_POINTER(REDRAW));
@@ -1189,6 +1501,29 @@ static void install_gui_and_size(GtkWidget *main_window) {
     install_gui(main_window, w, h, x, y);
 }
 
+/* File > Handheld Explorer... */
+static void cb_explorer(GtkWidget *widget, gpointer data) {
+    explorer_gui(window);
+}
+
+/* File > Profiles... */
+static void cb_profiles(GtkWidget *widget, gpointer data) {
+    gchar *name = profiles_gui(window);
+
+    if (!name) {
+        return;
+    }
+    if (sync_connected) {
+        jp_logf(JP_LOG_WARN, _("A HotSync is in progress; open the profile when it has finished.\n"));
+        g_free(name);
+        return;
+    }
+    /* Shut down normally, then main() starts J-Pilot again in the profile */
+    g_free(restart_profile);
+    restart_profile = name;
+    cb_delete_event(window, NULL, NULL);
+}
+
 static void cb_install_gui(GtkWidget *widget, gpointer data) {
     jp_logf(JP_LOG_DEBUG, "cb_install_gui()\n");
 
@@ -1327,6 +1662,7 @@ static void get_main_menu(GtkWidget *my_window,
     GtkWidget *sep = gtk_separator_menu_item_new();
     gtk_menu_shell_append(GTK_MENU_SHELL(menu1), sep);
     create_menu_item(menu1, accel_group, "gtk-open", NULL, "Install", GDK_KEY_i, GDK_CONTROL_MASK, cb_install_gui, NULL);
+    create_menu_item(menu1, NULL, "drive-removable-media", NULL, _("Handheld Explorer..."), -1, 0, cb_explorer, NULL);
     create_menu_item(menu1, NULL, "gtk-go-forward", NULL, "Import", -1, GDK_CONTROL_MASK, cb_import, NULL);
     create_menu_item(menu1, NULL, "gtk-go-back", NULL, "Export", -1, GDK_CONTROL_MASK, cb_export, NULL);
     create_menu_item(menu1, accel_group, "gtk-preferences", NULL, "Preferences", GDK_KEY_s, GDK_CONTROL_MASK, cb_prefs_gui, NULL);
@@ -1335,6 +1671,13 @@ static void get_main_menu(GtkWidget *my_window,
     gtk_menu_shell_append(GTK_MENU_SHELL(menu1), sep);
     create_menu_item(menu1, NULL, "", user_icon, "Install User", -1, GDK_CONTROL_MASK, cb_install_user, NULL);
     create_menu_item(menu1, NULL, "gtk-redo", NULL, "Restore Handheld", -1, GDK_CONTROL_MASK, cb_restore, NULL);
+    sep = gtk_separator_menu_item_new();
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu1), sep);
+    create_menu_item(menu1, NULL, "system-users", NULL, _("Profiles..."), -1, 0, cb_profiles, NULL);
+    menu_listen = gtk_check_menu_item_new_with_mnemonic(_("_Listen for HotSync"));
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(menu_listen), listening);
+    g_signal_connect(G_OBJECT(menu_listen), "toggled", G_CALLBACK(cb_listen_toggled), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu1), menu_listen);
     sep = gtk_separator_menu_item_new();
     gtk_menu_shell_append(GTK_MENU_SHELL(menu1), sep);
     create_menu_item(menu1, accel_group, "gtk-quit", NULL, "Quit", GDK_KEY_q, GDK_CONTROL_MASK, cb_delete_event, NULL);
@@ -1445,6 +1788,9 @@ static void cb_delete_event(GtkWidget *widget, GdkEvent *event, gpointer data) {
     }
 #endif
 
+    /* End the Handheld Explorer's HotSync session, if any */
+    explorer_shutdown();
+
     if (glob_child_pid) {
         jp_logf(JP_LOG_DEBUG, "killing %d\n", glob_child_pid);
         kill(glob_child_pid, SIGTERM);
@@ -1488,11 +1834,18 @@ static gint cb_output_idle(gpointer data) {
 }
 
 static gint cb_output2(GtkWidget *widget, GdkEventButton *event, gpointer data) {
+    /* Only when the divider itself was dragged.  Button releases anywhere
+     * in the window bubble up to the pane, and recording the size then
+     * saved the height of a closed pane (1 pixel) as the user's choice. */
+    if (event->window != gtk_paned_get_handle_window(GTK_PANED(widget))) {
+        return FALSE;
+    }
+
     /* Because the pane isn't redrawn yet we can't get positions from it.
      * So we have to call back after everything is drawn */
     g_idle_add(cb_output_idle, data);
 
-    return EXIT_SUCCESS;
+    return FALSE;
 }
 
 static gint cb_check_version(gpointer main_window) {
@@ -1566,6 +1919,17 @@ int main(int argc, char *argv[]) {
 #endif
     int pid;
     int remote_sync = FALSE;
+    char profile_name[PROFILE_NAME_MAX + 1];
+    int have_profile_arg;
+
+    /* Pick the profile first: everything below, including the log file,
+     * lives in the profile's directory.  getopt() does not know about
+     * --profile, so it is taken out of argv here. */
+    have_profile_arg = profile_take_arg(&argc, argv, profile_name, sizeof(profile_name));
+    if (profile_startup(profile_name, have_profile_arg)) {
+        exit(1);
+    }
+    restart_argv = g_strdupv(argv);
 
     skip_plugins = FALSE;
     skip_past_alarms = FALSE;
@@ -1796,6 +2160,9 @@ int main(int argc, char *argv[]) {
         write_pid();
     }
 
+    /* Open this profile again next time */
+    profile_set_last(profile_get_active());
+
     /* Check to see if DB files are there */
     /* If not copy some empty ones over */
     if (!glob_sqlite) check_copy_DBs_to_home();
@@ -1882,21 +2249,7 @@ int main(int argc, char *argv[]) {
 
     read_gtkrc_file();
 
-    get_pref(PREF_USER, NULL, &svalue);
-
-    strcpy(title, PN" "VERSION);
-    if ((svalue) && (svalue[0])) {
-        strcat(title, _(" User: "));
-        /* Convert user name so that it can be displayed in window title */
-        /* We assume user name is coded in jpilot.rc as it is on the Palm Pilot */
-        {
-            char *newvalue;
-
-            newvalue = charset_p2newj(svalue, -1, char_set);
-            strcat(title, newvalue);
-            free(newvalue);
-        }
-    }
+    build_window_title(title, sizeof(title));
 
     window = gtk_widget_new(GTK_TYPE_WINDOW,
                             "type", GTK_WINDOW_TOPLEVEL,
@@ -2269,9 +2622,19 @@ int main(int argc, char *argv[]) {
 
     g_idle_add(cb_check_version, window);
 
+    /* Listen for HotSync if J-Pilot was listening when it last ran */
+    if (profile_get_listen()) {
+        set_listening(TRUE, FALSE);
+    }
+
     gtk_main();
 
     otherconv_free();
+
+    if (restart_profile) {
+        restart_into_profile();
+        return EXIT_FAILURE;
+    }
 
     return EXIT_SUCCESS;
 }

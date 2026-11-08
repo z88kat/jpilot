@@ -36,6 +36,10 @@
 #define INST_SDCARD_COLUMN 0
 #define INST_FNAME_COLUMN  1
 
+/* Response id of the Delete (remove from list) button.  It must not reuse
+ * GTK_RESPONSE_DELETE_EVENT, which GTK sends when the window is closed. */
+#define INSTALL_RESPONSE_REMOVE 1
+
 /******************************* Global vars **********************************/
 static GtkWidget *treeView;
 static GtkListStore *listStore;
@@ -157,11 +161,6 @@ static int install_modify_line(int modified_line_num, const char *modified_line)
     rename_file(EPN".install.tmp", EPN".install");
 
     return EXIT_SUCCESS;
-}
-
-static gboolean cb_destroy(GtkWidget *widget) {
-    gtk_widget_destroy(GTK_WIDGET(widget));
-    return TRUE;
 }
 
 /* Save working directory for future installs */
@@ -448,7 +447,7 @@ int install_gui(GtkWidget *main_window, int w, int h, int x, int y) {
     install_update_listStore();
     g_snprintf(temp_str, sizeof(temp_str), "%s %s", PN, _("Install"));
     fileChooserWidget = gtk_file_chooser_dialog_new(_("Install"), GTK_WINDOW(main_window), GTK_FILE_CHOOSER_ACTION_OPEN,
-                                                    "_Add", GTK_RESPONSE_ACCEPT,"_Delete", GTK_RESPONSE_DELETE_EVENT,
+                                                    "_Add", GTK_RESPONSE_ACCEPT,"_Delete", INSTALL_RESPONSE_REMOVE,
                                                     "Close",GTK_RESPONSE_CLOSE,
                                                     NULL);
     get_pref(PREF_INSTALL_PATH, NULL, &svalue);
@@ -459,24 +458,21 @@ int install_gui(GtkWidget *main_window, int w, int h, int x, int y) {
     gtk_box_pack_start(extraWidget,treeView,TRUE,TRUE,0);
     gtk_widget_show_all(GTK_WIDGET(extraWidget));
     gtk_file_chooser_set_extra_widget(GTK_FILE_CHOOSER(fileChooserWidget), GTK_WIDGET(extraWidget));
-    g_signal_connect(G_OBJECT(fileChooserWidget), "destroy",
-                       G_CALLBACK(cb_destroy), fileChooserWidget);
-    int dialogResponse = gtk_dialog_run(GTK_DIALOG(fileChooserWidget));
-    do {
-     if(dialogResponse == GTK_RESPONSE_DELETE_EVENT){
-         //remove from list
-         cb_remove(fileChooserWidget,fileChooserWidget);
-     } else if(dialogResponse == GTK_RESPONSE_ACCEPT){
-         // add to list.
-         cb_add(fileChooserWidget,fileChooserWidget);
-     } else {
-         // handle close and destroy widget.
-         cb_destroy(fileChooserWidget);
-     }
-     if(dialogResponse != GTK_RESPONSE_CLOSE){
-        dialogResponse = gtk_dialog_run(GTK_DIALOG (fileChooserWidget));
-     }
-    } while (dialogResponse != GTK_RESPONSE_CLOSE);
+    /* Add and Remove keep the dialog open; anything else closes it.  That
+     * includes GTK_RESPONSE_DELETE_EVENT (window close button or Escape)
+     * and GTK_RESPONSE_NONE (dialog destroyed while running).  The dialog
+     * is destroyed exactly once, here, after the loop. */
+    for (;;) {
+        int dialogResponse = gtk_dialog_run(GTK_DIALOG(fileChooserWidget));
+
+        if (dialogResponse == GTK_RESPONSE_ACCEPT) {
+            cb_add(fileChooserWidget, fileChooserWidget);
+        } else if (dialogResponse == INSTALL_RESPONSE_REMOVE) {
+            cb_remove(fileChooserWidget, fileChooserWidget);
+        } else {
+            break;
+        }
+    }
 
     gtk_widget_destroy(GTK_WIDGET(fileChooserWidget));
 
