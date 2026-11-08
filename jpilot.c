@@ -113,6 +113,23 @@ static gchar *restart_profile = NULL;
 static gchar *sync_profile = NULL;
 /* The sync child has a handheld connected (PIPE_CONNECTED) */
 static int sync_connected = FALSE;
+
+/* Listening for HotSync: a sync is kept waiting for a handheld at all
+ * times, so pressing HotSync on the handheld is enough. */
+#define LISTEN_RESTART_SECS     2  /* pause before waiting again */
+#define LISTEN_QUICK_EXIT_SECS  5  /* a wait shorter than this failed to start */
+#define LISTEN_MAX_QUICK_EXITS  3  /* stop listening after this many in a row */
+static int listening = FALSE;
+static GtkWidget *menu_listen = NULL;
+/* Set while the code itself changes the menu item, so that its "toggled"
+ * handler does not take it for the user's choice */
+static int listen_menu_updating = FALSE;
+static guint listen_timer = 0;
+static time_t listen_started = 0;
+static int listen_quick_exits = 0;
+/* A Sync or Backup the user asked for while a sync was waiting */
+static int pending_sync = FALSE;
+static unsigned int pending_sync_flags = 0;
 /* jpilot.c file globals */
 static GtkWidget *g_hbox, *g_vbox0;
 static GtkWidget *g_hbox2, *g_vbox0_1;
@@ -661,9 +678,110 @@ static void sync_sig_handler(int sig) {
     }
 }
 
+static void start_sync(unsigned int flags) {
+    int r;
+
+    listen_started = time(NULL);
+    r = setup_sync(flags);
+
+    /* Fork successful, child sync process started */
+    if (glob_child_pid && (r == EXIT_SUCCESS)) {
+        gtk_widget_hide(button_sync);
+        gtk_widget_show(button_cancel_sync);
+    }
+}
+
+static void set_listening(int on, int save);
+
+static gboolean cb_listen_start(gpointer data) {
+    listen_timer = 0;
+    if (!listening || glob_child_pid || restart_profile) {
+        return FALSE;
+    }
+    start_sync((skip_plugins ? SYNC_NO_PLUGINS : 0) | SYNC_BACKGROUND);
+    if (!glob_child_pid) {
+        jp_logf(JP_LOG_WARN, _("Unable to listen for HotSync: the sync could not be started in the background.\n"));
+        set_listening(FALSE, FALSE);
+    }
+    return FALSE;
+}
+
+static void listen_schedule(int secs) {
+    if (!listen_timer) {
+        listen_timer = g_timeout_add_seconds(secs, cb_listen_start, NULL);
+    }
+}
+
+/* Start or stop listening for HotSync.  save makes it the setting for
+ * the next time J-Pilot starts. */
+static void set_listening(int on, int save) {
+    if (save) {
+        profile_set_listen(on);
+    }
+    if (menu_listen &&
+        (gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(menu_listen)) != on)) {
+        listen_menu_updating = TRUE;
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(menu_listen), on);
+        listen_menu_updating = FALSE;
+    }
+    if (listening == on) {
+        return;
+    }
+    listening = on;
+
+    if (on) {
+        listen_quick_exits = 0;
+        jp_logf(JP_LOG_GUI, _("Listening for HotSync: press HotSync on a handheld at any time.\n"));
+        if (!glob_child_pid) {
+            listen_schedule(0);
+        }
+    } else {
+        if (listen_timer) {
+            g_source_remove(listen_timer);
+            listen_timer = 0;
+        }
+        /* Stop a sync that is only waiting; let one under way finish */
+        if (glob_child_pid && !sync_connected) {
+            kill(glob_child_pid, SIGTERM);
+        }
+        if (save) {
+            jp_logf(JP_LOG_GUI, _("Stopped listening for HotSync.\n"));
+        }
+    }
+}
+
+static void cb_listen_toggled(GtkCheckMenuItem *item, gpointer data) {
+    if (listen_menu_updating) {
+        return;
+    }
+    set_listening(gtk_check_menu_item_get_active(item), TRUE);
+}
+
+/* After a sync process has gone: run the sync the user asked for while it
+ * was waiting, or wait for the next HotSync */
+static void listen_after_sync(int was_connected) {
+    if (pending_sync) {
+        pending_sync = FALSE;
+        start_sync(pending_sync_flags);
+        return;
+    }
+    if (!listening) {
+        return;
+    }
+    if (!was_connected && (time(NULL) - listen_started < LISTEN_QUICK_EXIT_SECS)) {
+        if (++listen_quick_exits >= LISTEN_MAX_QUICK_EXITS) {
+            jp_logf(JP_LOG_WARN, _("Stopped listening for HotSync: the sync keeps stopping before a handheld connects.\n"));
+            set_listening(FALSE, FALSE);
+            return;
+        }
+    } else {
+        listen_quick_exits = 0;
+    }
+    listen_schedule(LISTEN_RESTART_SECS);
+}
+
 static void cb_sync(GtkWidget *widget, unsigned int flags) {
     long ivalue;
-    int r;
 
     /* confirm file installation */
     get_pref(PREF_CONFIRM_FILE_INSTALL, &ivalue, NULL);
@@ -683,14 +801,15 @@ static void cb_sync(GtkWidget *widget, unsigned int flags) {
         }
     }
 
-    r = setup_sync(flags);
-
-    /* Fork successful, child sync process started */
-    if (glob_child_pid && (r == EXIT_SUCCESS)) {
-        gtk_widget_hide(button_sync);
-        gtk_widget_show(button_cancel_sync);
+    if (glob_child_pid && listening && !sync_connected) {
+        /* Replace the sync waiting for HotSync with the one asked for */
+        pending_sync = TRUE;
+        pending_sync_flags = flags;
+        kill(glob_child_pid, SIGTERM);
+        return;
     }
 
+    start_sync(flags);
 }
 
 void cb_cancel_sync(GtkWidget *widget, unsigned int flags);
@@ -707,6 +826,13 @@ static const char *getWebMenuXmlString();
 
 
 void cb_cancel_sync(GtkWidget *widget, unsigned int flags) {
+    /* widget is NULL when called to reset the buttons after a sync */
+    if (widget && listening) {
+        set_listening(FALSE, TRUE);
+    }
+    if (widget) {
+        pending_sync = FALSE;
+    }
     if (glob_child_pid) {
         jp_logf(JP_LOG_GUI, "****************************************\n");
         jp_logf(JP_LOG_GUI, _(" Cancelling HotSync\n"));
@@ -840,6 +966,8 @@ static gboolean cb_restart_into_profile(gpointer data) {
 /* Called once the sync process has gone (or, when syncing inside this
  * process, once it has finished). */
 void sync_child_exited(void) {
+    int was_connected = sync_connected;
+
     sync_connected = FALSE;
 
     if (sync_profile) {
@@ -854,6 +982,8 @@ void sync_child_exited(void) {
         g_idle_add(cb_restart_into_profile, NULL);
         return;
     }
+
+    listen_after_sync(was_connected);
 }
 
 /* Replace this process with J-Pilot running restart_profile */
@@ -1437,6 +1567,12 @@ static void get_main_menu(GtkWidget *my_window,
     gtk_menu_shell_append(GTK_MENU_SHELL(menu1), sep);
     create_menu_item(menu1, NULL, "", user_icon, "Install User", -1, GDK_CONTROL_MASK, cb_install_user, NULL);
     create_menu_item(menu1, NULL, "gtk-redo", NULL, "Restore Handheld", -1, GDK_CONTROL_MASK, cb_restore, NULL);
+    sep = gtk_separator_menu_item_new();
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu1), sep);
+    menu_listen = gtk_check_menu_item_new_with_mnemonic(_("_Listen for HotSync"));
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(menu_listen), listening);
+    g_signal_connect(G_OBJECT(menu_listen), "toggled", G_CALLBACK(cb_listen_toggled), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu1), menu_listen);
     sep = gtk_separator_menu_item_new();
     gtk_menu_shell_append(GTK_MENU_SHELL(menu1), sep);
     create_menu_item(menu1, accel_group, "gtk-quit", NULL, "Quit", GDK_KEY_q, GDK_CONTROL_MASK, cb_delete_event, NULL);
@@ -2370,6 +2506,11 @@ int main(int argc, char *argv[]) {
     }
 
     g_idle_add(cb_check_version, window);
+
+    /* Listen for HotSync if J-Pilot was listening when it last ran */
+    if (profile_get_listen()) {
+        set_listening(TRUE, FALSE);
+    }
 
     gtk_main();
 

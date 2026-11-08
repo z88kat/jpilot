@@ -34,6 +34,10 @@
  * It does not fork, but it has a parent that can answer questions over the
  * pipes. */
 #define SYNC_HELPER        0x40
+/* Only sync in a separate process; fail rather than sync inside the GUI
+ * process, which would freeze it while waiting for the handheld.  Used
+ * when listening for HotSync. */
+#define SYNC_BACKGROUND    0x80
 
 #define SYNC_ERROR_BIND            -10
 #define SYNC_ERROR_LISTEN          -11

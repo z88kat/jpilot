@@ -767,6 +767,10 @@ static int jp_pilot_connect(int *Psd, const char *device)
    int logged_wait = 0;
    int waited = 0;
    int max_wait = 0;
+   /* A forked child or the sync helper reports to this process */
+   int has_parent_gui = (getpid() != jpilot_master_pid) &&
+                        (pipe_to_parent != STDOUT_FILENO);
+   pid_t parent_pid = getppid();
    struct  SysInfo sys_info;
 
    *Psd=0;
@@ -881,6 +885,14 @@ static int jp_pilot_connect(int *Psd, const char *device)
             jp_logf(JP_LOG_WARN, _("See %s\n"), JP_PERMISSIONS_URL);
             return SYNC_ERROR_PI_ACCEPT;
          }
+      }
+
+      /* If the GUI that started us has gone, nobody is listening to us any
+       * more, and waiting on would keep the port and the sync lock until a
+       * handheld turned up -- and then fail halfway through its sync. */
+      if (has_parent_gui && (getppid() != parent_pid)) {
+         jp_logf(JP_LOG_WARN, _("%s has exited; no longer waiting for the handheld.\n"), PN);
+         return SYNC_ERROR_PI_ACCEPT;
       }
 
       waited += SYNC_ACCEPT_SLICE_SECS;
@@ -4077,6 +4089,9 @@ int sync_once(struct my_sync_info *sync_info)
    if (!(SYNC_NO_FORK & sync_info->flags)) {
       if (sync_spawn_helper(sync_info) == EXIT_SUCCESS) {
          return EXIT_SUCCESS;
+      }
+      if (SYNC_BACKGROUND & sync_info->flags) {
+         return EXIT_FAILURE;
       }
       jp_logf(JP_LOG_WARN, _("Syncing inside %s instead; it will not respond until the sync is finished.\n"), PN);
       sync_info->flags |= SYNC_NO_FORK;
