@@ -173,6 +173,13 @@ pilot-install-user -p usb: -u "Judd" -i 12345
 ```
 Of course replace "Judd" and "12345" with you favorite name and number.  PalmOS requires the user ID to be a 5-digit number.  Use the same port here that you use for syncing, so `/dev/ttyUSB1` (or whichever node) instead of `usb:` if you are using the visor module.
 
+### Building a macOS app
+`macos/make-app.sh` builds `J-Pilot.app` and installs it in `/Applications`, so J-Pilot can be started from the Finder, Launchpad or Spotlight like any other application:
+```shell
+macos/make-app.sh
+```
+It needs Homebrew (`gtk+3 libgcrypt sqlite gettext intltool autoconf automake libtool pkg-config imagemagick`) and pilot-link 0.15 or later, looked for in `~/.local` (set `PILOT_PREFIX` to use another place).  pilot-link is copied into the app; GTK and the other Homebrew libraries are not, so the app runs on Macs that have them installed.  The app works only in the folder it was built for: to put it somewhere else, give that folder as the argument.  Run the script again to rebuild the app after changing J-Pilot or pilot-link.  J-Pilot's data stays in `~/.jpilot`.
+
 ### Building a Debian (or ubuntu) package
 From the repo root, with the tree already configured (e.g. after ./configure):
 
