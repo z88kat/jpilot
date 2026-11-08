@@ -91,13 +91,13 @@ static int jp_vlogf (int level, const char *format, va_list val) {
       return EXIT_SUCCESS;
    }
 
-   if ((!fp) && (err_count>10)) {
-      return EXIT_FAILURE;
-   }
+   /* Failing to open the log file only stops logging to the file.  This
+    * used to return early, which also silenced stdout and the GUI output
+    * pane for the rest of the session.  That happened on every first run,
+    * because the first messages are logged before ~/.jpilot exists. */
    if ((!fp) && (err_count==10)) {
       fprintf(stderr, _("Unable to open log file, giving up.\n"));
       err_count++;
-      return EXIT_FAILURE;
    }
    if ((!fp) && (err_count<10)) {
       char fullname[FILENAME_MAX];

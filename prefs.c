@@ -65,7 +65,7 @@ static int t_fmt_ampm = TRUE;
    {"user", CHARTYPE, CHARTYPE, 0, NULL, 0},
    {"user_id", INTTYPE, INTTYPE, 0, NULL, 0},
    {"pc_id", INTTYPE, INTTYPE, 0, NULL, 0},
-   {"num_backups", INTTYPE, INTTYPE, 2, NULL, 0},
+   {"num_backups", INTTYPE, INTTYPE, 4, NULL, 0},
    {"window_width", INTTYPE, INTTYPE, 640, NULL, 0},
    {"window_height", INTTYPE, INTTYPE, 480, NULL, 0},
    {"datebook_pane", INTTYPE, INTTYPE, 370, NULL, 0},
