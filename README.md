@@ -151,11 +151,14 @@ With **File -> Listen for HotSync** turned on, J-Pilot is always waiting for a h
 On macOS the sync runs in a separate `jpilot-sync` process, so J-Pilot stays responsive while it waits for the handheld.
 
 ### BACKUP and SYNC
-Just a warning that a sync DOES NOT backup your palm.  
-The Sync button will sync the 4 applications with the palm pilot and any plugins that are installed.  
-  
-The Backup button will backup every program and database from the palm pilot, except for AvantGo files (these are usually big and change daily).  
-  
+The Sync button syncs the 4 applications with the palm pilot and any plugins that are installed.  By default a sync DOES NOT back up your palm.
+
+The Backup button syncs and then backs up every program and database from the palm pilot, except for AvantGo files (these are usually big and change daily).
+
+To back up on every sync, turn on **Back up the handheld on every sync** in File -> Preferences -> Settings.  It is a setting of the profile, so it applies whichever way the sync starts (the Sync button, listening for HotSync, or jpilot-sync).  Backups are incremental: each one starts as a copy of the previous one and only fetches the databases that changed, so after the first one they are quick.
+
+Backups are kept in the profile's directory as `backupYYYYMMDDhhmm`, with `backup` pointing at the newest; "Number of backups to be archived" in the same preferences tab says how many are kept.  Databases that have been deleted from the handheld are moved to `backup_removed`.  File -> Restore Handheld restores the newest backup.
+
 If you get an error saying that you have a NULL user ID, then you need to run install-user from the pilot-link suite.  On Debian and Ubuntu it is installed as `pilot-install-user`.
 ```shell
 pilot-install-user -p usb: -u "Judd" -i 12345
