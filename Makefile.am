@@ -60,6 +60,7 @@ jpilot_SOURCES = \
 	jpilot.c \
 	explorer.c \
 	explorer.h \
+	explorer_proto.h \
 	profile_gui.c \
 	profile_gui.h \
 	jpilot.h \
@@ -152,6 +153,9 @@ jpilot_sync_SOURCES = \
 	cp1250.c \
 	category.c \
 	jpilot-sync.c \
+	explorer_server.c \
+	explorer_server.h \
+	explorer_proto.h \
 	japanese.c \
 	libplugin.c \
 	libsqlite.c \

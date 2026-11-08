@@ -139,19 +139,28 @@ static int sync_can_ask_parent(unsigned int flags)
    return !(SYNC_NO_FORK & flags) || (SYNC_HELPER & flags);
 }
 
-#ifdef __APPLE__
 /* Find the jpilot-sync program that sits next to the running jpilot, so
  * that a jpilot run from the build directory uses the jpilot-sync built
  * with it.  Falls back to searching $PATH.  Returns a newly allocated path,
  * or NULL. */
-static gchar *sync_find_helper(void)
+gchar *jp_find_sync_helper(void)
 {
    char exe_path[PATH_MAX];
    char real_path[PATH_MAX];
+   int found = FALSE;
+#ifdef __APPLE__
    uint32_t size = sizeof(exe_path);
 
-   if ((_NSGetExecutablePath(exe_path, &size) == 0) &&
-       (realpath(exe_path, real_path) != NULL)) {
+   found = (_NSGetExecutablePath(exe_path, &size) == 0);
+#else
+   ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+
+   if (len > 0) {
+      exe_path[len] = '\0';
+      found = TRUE;
+   }
+#endif
+   if (found && (realpath(exe_path, real_path) != NULL)) {
       gchar *dir = g_path_get_dirname(real_path);
       gchar *candidate = g_build_filename(dir, EPN"-sync", NULL);
 
@@ -165,6 +174,7 @@ static gchar *sync_find_helper(void)
    return g_find_program_in_path(EPN"-sync");
 }
 
+#ifdef __APPLE__
 /*
  * Start the sync in a separate jpilot-sync process instead of forking.
  *
@@ -189,7 +199,7 @@ static int sync_spawn_helper(struct my_sync_info *sync_info)
    GPid pid;
    int argc = 0;
 
-   helper = sync_find_helper();
+   helper = jp_find_sync_helper();
    if (!helper) {
       jp_logf(JP_LOG_WARN, _("Unable to find %s\n"), EPN"-sync");
       return EXIT_FAILURE;

@@ -35,6 +35,7 @@
 #include "sync.h"
 #include "plugins.h"
 #include "otherconv.h"
+#include "explorer_server.h"
 
 /******************************* Global vars **********************************/
 int pipe_to_parent, pipe_from_parent;
@@ -107,6 +108,7 @@ int main(int argc, char *argv[])
    int r, i;
    int loop;
    int helper;
+   int explorer_out = -1, explorer_in = -1;
    char port[MAX_PREF_LEN];
 #ifdef ENABLE_PLUGINS
    struct plugin_s *plugin;
@@ -170,6 +172,14 @@ int main(int argc, char *argv[])
          pipe_from_parent = atoi(argv[++i]);
          continue;
       }
+      /* The Handheld Explorer window starts us like this to talk to the
+       * handheld for it (see explorer_server.c) */
+      if (!strcmp(argv[i], "--explorer") && (i+2 < argc)) {
+         explorer_out = atoi(argv[++i]);
+         explorer_in = atoi(argv[++i]);
+         glob_log_file_append = 1;
+         continue;
+      }
       if (!strcmp(argv[i], "--flags") && (i+1 < argc)) {
          flags |= (unsigned int) strtoul(argv[++i], NULL, 10);
          continue;
@@ -230,6 +240,16 @@ int main(int argc, char *argv[])
             set_pref(PREF_PORT, 0, port, FALSE);
          }
       }
+   }
+
+   if (explorer_out >= 0) {
+      const char *svalue;
+
+      /* No plugins, no sync: just the handheld for the explorer window */
+      get_pref(PREF_PORT, NULL, &svalue);
+      r = explorer_server(explorer_out, explorer_in, port[0] ? port : (svalue ? svalue : "usb:"));
+      otherconv_free();
+      return r;
    }
 
    if (helper) {
