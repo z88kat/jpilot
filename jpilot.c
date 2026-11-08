@@ -52,6 +52,7 @@
 #include "datebook.h"
 #include "address.h"
 #include "install_user.h"
+#include "profile_gui.h"
 #include "todo.h"
 #include "memo.h"
 #include "sync.h"
@@ -1421,6 +1422,24 @@ static void install_gui_and_size(GtkWidget *main_window) {
     install_gui(main_window, w, h, x, y);
 }
 
+/* File > Profiles... */
+static void cb_profiles(GtkWidget *widget, gpointer data) {
+    gchar *name = profiles_gui(window);
+
+    if (!name) {
+        return;
+    }
+    if (sync_connected) {
+        jp_logf(JP_LOG_WARN, _("A HotSync is in progress; open the profile when it has finished.\n"));
+        g_free(name);
+        return;
+    }
+    /* Shut down normally, then main() starts J-Pilot again in the profile */
+    g_free(restart_profile);
+    restart_profile = name;
+    cb_delete_event(window, NULL, NULL);
+}
+
 static void cb_install_gui(GtkWidget *widget, gpointer data) {
     jp_logf(JP_LOG_DEBUG, "cb_install_gui()\n");
 
@@ -1569,6 +1588,7 @@ static void get_main_menu(GtkWidget *my_window,
     create_menu_item(menu1, NULL, "gtk-redo", NULL, "Restore Handheld", -1, GDK_CONTROL_MASK, cb_restore, NULL);
     sep = gtk_separator_menu_item_new();
     gtk_menu_shell_append(GTK_MENU_SHELL(menu1), sep);
+    create_menu_item(menu1, NULL, "system-users", NULL, _("Profiles..."), -1, 0, cb_profiles, NULL);
     menu_listen = gtk_check_menu_item_new_with_mnemonic(_("_Listen for HotSync"));
     gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(menu_listen), listening);
     g_signal_connect(G_OBJECT(menu_listen), "toggled", G_CALLBACK(cb_listen_toggled), NULL);
