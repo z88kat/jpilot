@@ -96,6 +96,8 @@ extern pid_t jpilot_master_pid;
 /****************************** Prototypes ************************************/
 /* From jpilot.c for restoring sync icon after successful sync */
 extern void cb_cancel_sync(GtkWidget *widget, unsigned int flags);
+/* From jpilot.c, called once the sync child has exited */
+extern void sync_child_exited(void);
 
 static int pi_file_install_VFS(const int fd, const char *basename, const int socket, const char *vfspath, progress_func f);
 static int findVFSPath(int sd, const char *path, long *volume, char *rpath, int *rpathlen);
@@ -125,6 +127,7 @@ static void on_sync_child_exit(GPid pid, gint status, gpointer data)
     * Sync/Cancel buttons rather than trying to kill an already-dead child. */
    glob_child_pid = 0;
    cb_cancel_sync(NULL, 0);
+   sync_child_exited();
 }
 
 /* Whether a question (for example "this is a different handheld, sync
@@ -3376,7 +3379,181 @@ static int fast_sync_application(char *DB_name, int sd)
    return EXIT_SUCCESS;
 }
 
-static int jp_install_user(const char *device, int sd, 
+/* Set when this sync moved to another profile, or detected the databases
+ * of a profile's first handheld.  The parent GUI has stale preferences for
+ * that profile then, so this process saves them itself. */
+static int sync_saves_identity = FALSE;
+
+static long sync_new_pc_id(void)
+{
+   srandom(time(NULL) ^ getpid());
+   return 1 + (long) (2000000000.0 * random() / (RAND_MAX + 1.0));
+}
+
+/* Make another profile the one this sync process works in.  The handheld
+ * is already connected, so the port is not changed. */
+static void sync_switch_profile(const char *name, struct my_sync_info *sync_info)
+{
+   const char *svalue;
+   long ivalue;
+
+   profile_set_active(name);
+
+   /* A profile's rc file may leave these out or empty, and then reading it
+    * would keep the old profile's values. */
+   set_pref(PREF_USER, 0, "", FALSE);
+   set_pref(PREF_USER_ID, 0, NULL, FALSE);
+   set_pref(PREF_PC_ID, 0, NULL, FALSE);
+   set_pref(PREF_DATEBOOK_VERSION, 0, NULL, FALSE);
+   set_pref(PREF_ADDRESS_VERSION, 0, NULL, FALSE);
+   set_pref(PREF_TODO_VERSION, 0, NULL, FALSE);
+   set_pref(PREF_MEMO_VERSION, 0, NULL, FALSE);
+   pref_read_rc_file();
+
+   check_hidden_dir();
+   if (!glob_sqlite) {
+      check_copy_DBs_to_home();
+   }
+
+   get_pref(PREF_USER, NULL, &svalue);
+   g_strlcpy(sync_info->username, svalue ? svalue : "", sizeof(sync_info->username));
+   get_pref(PREF_USER_ID, &(sync_info->userID), NULL);
+   get_pref(PREF_NUM_BACKUPS, &ivalue, NULL);
+   sync_info->num_backups = ivalue;
+   get_pref(PREF_PC_ID, &(sync_info->PC_ID), NULL);
+   if (sync_info->PC_ID == 0) {
+      sync_info->PC_ID = sync_new_pc_id();
+      set_pref(PREF_PC_ID, sync_info->PC_ID, NULL, FALSE);
+   }
+
+   sync_saves_identity = TRUE;
+   write_to_parent(PIPE_PROFILE, "\"%s\"\n", name);
+}
+
+/* For a profile's first sync: use the newer Calendar, Contacts and Memos
+ * databases if the handheld has them (Palm OS 5.2.1 and later), the
+ * classic ones otherwise.  ToDo is left alone: J-Pilot cannot read the
+ * Tasks database fully yet, and handhelds that have it keep ToDoDB up to
+ * date as well. */
+static void sync_detect_databases(int sd)
+{
+   static const struct {
+      const char *db_name;
+      int pref;
+      const char *label;
+   } newer_dbs[] = {
+      { "CalendarDB-PDat", PREF_DATEBOOK_VERSION, N_("Calendar") },
+      { "ContactsDB-PAdd", PREF_ADDRESS_VERSION,  N_("Contacts") },
+      { "MemosDB-PMem",    PREF_MEMO_VERSION,     N_("Memos") },
+   };
+   struct DBInfo info;
+   unsigned int i;
+   int r;
+
+   for (i = 0; i < sizeof(newer_dbs) / sizeof(newer_dbs[0]); i++) {
+      r = dlp_FindDBByName(sd, 0, newer_dbs[i].db_name, NULL, NULL, &info, NULL);
+      if (r >= 0) {
+         set_pref(newer_dbs[i].pref, 1, NULL, FALSE);
+         jp_logf(JP_LOG_GUI, _("This handheld uses the %s database.\n"),
+                 _(newer_dbs[i].label));
+      } else if (r == PI_ERR_DLP_PALMOS) {
+         /* Not found */
+         set_pref(newer_dbs[i].pref, 0, NULL, FALSE);
+      } else {
+         jp_logf(JP_LOG_DEBUG, "looking for %s failed (%d), keeping setting\n",
+                 newer_dbs[i].db_name, r);
+      }
+   }
+   sync_saves_identity = TRUE;
+}
+
+/*
+ * Make sure the data of the handheld that just connected goes into its own
+ * profile:
+ *  - if another profile was last synced with this handheld, switch to it;
+ *  - if the current profile belongs to a different handheld and no profile
+ *    knows this one, create a profile for it, named after its user;
+ *  - otherwise stay, and on a profile's first sync detect its databases.
+ * The handheld is identified by its user ID.
+ */
+static void sync_select_profile(int sd, struct my_sync_info *sync_info)
+{
+   struct PilotUser U;
+   char match[PROFILE_NAME_MAX + 1];
+   char new_name[PROFILE_NAME_MAX + 1];
+   const char *target = NULL;
+
+   sync_saves_identity = FALSE;
+
+   if (getpid() == jpilot_master_pid) {
+      /* Syncing inside the GUI process; switching would pull the GUI's own
+       * preferences out from under it. */
+      return;
+   }
+   if (glob_sqlite) {
+      /* Profiles are told apart by their jpilot.rc files */
+      return;
+   }
+
+   memset(&U, 0, sizeof(U));
+   if (dlp_ReadUserInfo(sd, &U) < 0) {
+      return;
+   }
+   if (U.userID == 0) {
+      /* Left to the NULL user ID check */
+      return;
+   }
+
+   if (profile_get_auto_switch() &&
+       ((unsigned long) sync_info->userID != U.userID)) {
+      if (profile_find_by_user_id(U.userID, match, sizeof(match))) {
+         target = match;
+      } else if ((sync_info->userID != 0) || sync_info->username[0]) {
+         profile_make_unique_name(U.username, new_name, sizeof(new_name));
+         if (profile_create(new_name, profile_get_active()) == EXIT_SUCCESS) {
+            jp_logf(JP_LOG_GUI, _("New handheld \"%s\" (user ID %lu): "
+                                  "created profile \"%s\".\n"),
+                    U.username, U.userID, new_name);
+            target = new_name;
+         } else {
+            jp_logf(JP_LOG_WARN, _("Unable to create a profile for this handheld.\n"));
+         }
+      }
+   }
+
+   if (target && strcmp(target, profile_get_active())) {
+      jp_logf(JP_LOG_GUI, _("Syncing into profile \"%s\".\n"), profile_label(target));
+      sync_switch_profile(target, sync_info);
+   }
+
+   if (sync_info->userID == 0) {
+      sync_detect_databases(sd);
+   }
+
+   /* jpilot-sync run from a shell has no GUI to save who it synced with,
+    * and the next sync needs that to find this profile.  Only when this
+    * profile is the handheld's, though: otherwise the "different handheld"
+    * check below stops the sync. */
+   if ((pipe_to_parent == STDOUT_FILENO) &&
+       ((unsigned long) sync_info->userID == U.userID)) {
+      sync_saves_identity = TRUE;
+   }
+
+   if (sync_saves_identity) {
+      /* This is now the profile of this handheld */
+      g_strlcpy(sync_info->username, U.username, sizeof(sync_info->username));
+      sync_info->userID = U.userID;
+      set_pref(PREF_USER, 0, U.username, FALSE);
+      set_pref(PREF_USER_ID, U.userID, NULL, FALSE);
+      if (!target) {
+         /* Same profile, newly detected databases: the GUI must reload it */
+         write_to_parent(PIPE_PROFILE, "\"%s\"\n", profile_get_active());
+      }
+      pref_write_rc_file();
+   }
+}
+
+static int jp_install_user(const char *device, int sd,
                            struct my_sync_info *sync_info)
 {
    struct PilotUser U;
@@ -3476,38 +3653,6 @@ static int jp_sync(struct my_sync_info *sync_info)
 
    long datebook_version, address_version, todo_version, memo_version;
 
-   /* Convert to new database names if prefs set */
-   rename_dbnames(dbname);
-
-   /* Change unpack/pack function pointers if needed */
-   get_pref(PREF_DATEBOOK_VERSION, &datebook_version, NULL);
-   get_pref(PREF_ADDRESS_VERSION, &address_version, NULL);
-   get_pref(PREF_TODO_VERSION, &todo_version, NULL);
-   get_pref(PREF_MEMO_VERSION, &memo_version, NULL);
-   if (datebook_version==0) {
-      unpack_cai_from_buf[0]=unpack_datebook_cai_from_ai;
-      pack_cai_into_buf[0]=pack_datebook_cai_into_ai;
-   }
-   if (datebook_version==1) {
-      unpack_cai_from_buf[0]=unpack_calendar_cai_from_ai;
-      pack_cai_into_buf[0]=pack_calendar_cai_into_ai;
-   }
-   if (address_version==1) {
-      unpack_cai_from_buf[1]=unpack_contact_cai_from_ai;
-      pack_cai_into_buf[1]=pack_contact_cai_into_ai;
-   }
-   if (todo_version==1) {
-      /* FIXME: Uncomment when support for Task has been added
-      unpack_cai_from_buf[2]=unpack_task_cai_from_ai;
-      pack_cai_into_buf[2]=pack_task_cai_into_ai;
-      */
-      ;
-   }
-   if (memo_version==1) {
-      /* No change necessary between Memo and Memos databases */
-      ;
-   }
-
    /* Load the plugins for a forked process */
 #ifdef ENABLE_PLUGINS
    if (!(SYNC_NO_FORK & sync_info->flags) &&
@@ -3563,6 +3708,49 @@ static int jp_sync(struct my_sync_info *sync_info)
       write_to_parent(PIPE_FINISHED, "\n");
       return ret;
    }
+
+   /* Tell the GUI a handheld is connected: a sync is now under way and
+    * must not be interrupted */
+   write_to_parent(PIPE_CONNECTED, "\n");
+
+   /* Sync into the profile of the handheld that connected.  This can
+    * change the preferences, so the database names are chosen after it. */
+   if (!(SYNC_RESTORE & sync_info->flags)) {
+      sync_select_profile(sd, sync_info);
+   }
+
+   /* Convert to new database names if prefs set */
+   rename_dbnames(dbname);
+
+   /* Change unpack/pack function pointers if needed */
+   get_pref(PREF_DATEBOOK_VERSION, &datebook_version, NULL);
+   get_pref(PREF_ADDRESS_VERSION, &address_version, NULL);
+   get_pref(PREF_TODO_VERSION, &todo_version, NULL);
+   get_pref(PREF_MEMO_VERSION, &memo_version, NULL);
+   if (datebook_version==0) {
+      unpack_cai_from_buf[0]=unpack_datebook_cai_from_ai;
+      pack_cai_into_buf[0]=pack_datebook_cai_into_ai;
+   }
+   if (datebook_version==1) {
+      unpack_cai_from_buf[0]=unpack_calendar_cai_from_ai;
+      pack_cai_into_buf[0]=pack_calendar_cai_into_ai;
+   }
+   if (address_version==1) {
+      unpack_cai_from_buf[1]=unpack_contact_cai_from_ai;
+      pack_cai_into_buf[1]=pack_contact_cai_into_ai;
+   }
+   if (todo_version==1) {
+      /* FIXME: Uncomment when support for Task has been added
+      unpack_cai_from_buf[2]=unpack_task_cai_from_ai;
+      pack_cai_into_buf[2]=pack_task_cai_into_ai;
+      */
+      ;
+   }
+   if (memo_version==1) {
+      /* No change necessary between Memo and Memos databases */
+      ;
+   }
+
 
    /* The connection has been established here */
    /* Plugins should call pi_watchdog(); if they are going to be a while */

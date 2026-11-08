@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
+#include <errno.h>
 #include <ctype.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -103,6 +104,15 @@ gint glob_date_timer_tag;
 pid_t glob_child_pid;
 pid_t jpilot_master_pid;
 int plugin_number = DATEBOOK + 100;
+
+/* The command line, without --profile, for restarting into a profile */
+static char **restart_argv = NULL;
+/* Profile to restart into once J-Pilot has shut down, if any */
+static gchar *restart_profile = NULL;
+/* A sync moved to, or changed the settings of, this profile (PIPE_PROFILE) */
+static gchar *sync_profile = NULL;
+/* The sync child has a handheld connected (PIPE_CONNECTED) */
+static int sync_connected = FALSE;
 /* jpilot.c file globals */
 static GtkWidget *g_hbox, *g_vbox0;
 static GtkWidget *g_hbox2, *g_vbox0_1;
@@ -816,6 +826,53 @@ void output_to_pane(const char *str) {
 }
 
 
+static gboolean cb_restart_into_profile(gpointer data) {
+    /* The sync saved the settings of the profile it worked in.  If that is
+     * this profile, quitting must not overwrite them with ours. */
+    if (!strcmp(restart_profile, profile_get_active())) {
+        glob_rc_file_write = 0;
+    }
+    /* Shut down as if the window was closed; main() then restarts */
+    cb_delete_event(window, NULL, NULL);
+    return FALSE;
+}
+
+/* Called once the sync process has gone (or, when syncing inside this
+ * process, once it has finished). */
+void sync_child_exited(void) {
+    sync_connected = FALSE;
+
+    if (sync_profile) {
+        if (strcmp(sync_profile, profile_get_active())) {
+            jp_logf(JP_LOG_GUI, _("Opening profile \"%s\"...\n"), profile_label(sync_profile));
+        } else {
+            jp_logf(JP_LOG_GUI, _("Reloading the profile's new settings...\n"));
+        }
+        g_free(restart_profile);
+        restart_profile = sync_profile;
+        sync_profile = NULL;
+        g_idle_add(cb_restart_into_profile, NULL);
+        return;
+    }
+}
+
+/* Replace this process with J-Pilot running restart_profile */
+static void restart_into_profile(void) {
+    GPtrArray *args = g_ptr_array_new();
+    int i;
+
+    for (i = 0; restart_argv && restart_argv[i]; i++) {
+        g_ptr_array_add(args, restart_argv[i]);
+    }
+    g_ptr_array_add(args, "--profile");
+    g_ptr_array_add(args, restart_profile[0] ? restart_profile : PROFILE_DEFAULT_LABEL);
+    g_ptr_array_add(args, NULL);
+
+    execvp((char *) args->pdata[0], (char **) args->pdata);
+    fprintf(stderr, _("Unable to restart %s: %s\n"), PN, strerror(errno));
+    g_ptr_array_free(args, TRUE);
+}
+
 /* "J-Pilot 2.1.1 User: name", followed by the profile unless it is the
  * default one */
 static void build_window_title(char *title, size_t size) {
@@ -855,6 +912,10 @@ const char * pipe_command_to_text(int command) {
         return "WAITING_ON_USER";
     case PIPE_FINISHED:
         return "FINISHED";
+    case PIPE_PROFILE:
+        return "PROFILE";
+    case PIPE_CONNECTED:
+        return "CONNECTED";
     default:
         return "UNKNOWN";
     }
@@ -947,6 +1008,10 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
                     output_to_pane(Pstr1);
                     break;
                 case PIPE_USERID:
+                    if (sync_profile) {
+                        /* The sync process saved it in its profile */
+                        break;
+                    }
                     /* Save user ID as pref */
                     num = sscanf(Pstr1, "%lu", &user_id);
                     if (num > 0) {
@@ -957,6 +1022,9 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
                     }
                     break;
                 case PIPE_USERNAME:
+                    if (sync_profile) {
+                        break;
+                    }
                     /* Save username as pref */
                     Pstr2 = strchr(Pstr1, '\"');
                     if (Pstr2) {
@@ -974,6 +1042,9 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
                     }
                     break;
                 case PIPE_PASSWORD:
+                    if (sync_profile) {
+                        break;
+                    }
                     /* Save password as pref */
                     Pstr2 = strchr(Pstr1, '\"');
                     if (Pstr2) {
@@ -1017,7 +1088,24 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
                         fsync(pipe_to_child);
                     }
                     break;
+                case PIPE_CONNECTED:
+                    sync_connected = TRUE;
+                    break;
+                case PIPE_PROFILE:
+                    Pstr2 = strchr(Pstr1, '\"');
+                    Pstr3 = Pstr2 ? strchr(Pstr2 + 1, '\"') : NULL;
+                    if (Pstr3) {
+                        g_free(sync_profile);
+                        sync_profile = g_strndup(Pstr2 + 1, Pstr3 - Pstr2 - 1);
+                    }
+                    break;
                 case PIPE_FINISHED:
+                    if (sync_profile && !glob_child_pid) {
+                        /* Synced inside this process; there is no child
+                         * exit to wait for */
+                        sync_child_exited();
+                        break;
+                    }
                     /* Update main window title as user name may have changed */
                     build_window_title(title, sizeof(title));
                     gtk_window_set_title(GTK_WINDOW(window), title);
@@ -1590,6 +1678,7 @@ int main(int argc, char *argv[]) {
     if (profile_startup(profile_name, have_profile_arg)) {
         exit(1);
     }
+    restart_argv = g_strdupv(argv);
 
     skip_plugins = FALSE;
     skip_past_alarms = FALSE;
@@ -2285,6 +2374,11 @@ int main(int argc, char *argv[]) {
     gtk_main();
 
     otherconv_free();
+
+    if (restart_profile) {
+        restart_into_profile();
+        return EXIT_FAILURE;
+    }
 
     return EXIT_SUCCESS;
 }

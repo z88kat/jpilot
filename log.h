@@ -38,6 +38,8 @@
 #define PIPE_PASSWORD        103
 #define PIPE_WAITING_ON_USER 104
 #define PIPE_FINISHED        105
+#define PIPE_PROFILE         106  /* the sync moved to, or changed, this profile */
+#define PIPE_CONNECTED       107  /* a handheld connected; the sync is under way */
 #define PIPE_SYNC_CONTINUE   200
 #define PIPE_SYNC_CANCEL     201
 

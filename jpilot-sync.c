@@ -56,6 +56,7 @@ gint glob_date_timer_tag;
 void output_to_pane(const char *str) { return; }
 void cb_app_button(GtkWidget *widget, gpointer data) { return; }
 void cb_cancel_sync(GtkWidget *widget, unsigned int flags) { return; }
+void sync_child_exited(void) { return; }
 /* End Hack */
 
 /****************************** Main Code *************************************/
