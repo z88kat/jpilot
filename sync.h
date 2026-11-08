@@ -62,6 +62,8 @@ struct my_sync_info {
 };
 
 int sync_once(struct my_sync_info *sync_info);
+int jp_port_trylock(int *fd);
+int jp_port_unlock(int fd);
 int sync_loop(const char *port, unsigned int flags, const int num_backups);
 
 #endif

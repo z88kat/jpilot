@@ -58,6 +58,8 @@ jpilot_SOURCES = \
 	japanese.c \
 	japanese.h \
 	jpilot.c \
+	explorer.c \
+	explorer.h \
 	profile_gui.c \
 	profile_gui.h \
 	jpilot.h \

@@ -53,6 +53,7 @@
 #include "address.h"
 #include "install_user.h"
 #include "profile_gui.h"
+#include "explorer.h"
 #include "todo.h"
 #include "memo.h"
 #include "sync.h"
@@ -128,6 +129,8 @@ static int listen_menu_updating = FALSE;
 static guint listen_timer = 0;
 static time_t listen_started = 0;
 static int listen_quick_exits = 0;
+/* Listening is paused while the Handheld Explorer uses the port */
+static int listen_paused = FALSE;
 /* A Sync or Backup the user asked for while a sync was waiting */
 static int pending_sync = FALSE;
 static unsigned int pending_sync_flags = 0;
@@ -696,7 +699,7 @@ static void set_listening(int on, int save);
 
 static gboolean cb_listen_start(gpointer data) {
     listen_timer = 0;
-    if (!listening || glob_child_pid || restart_profile) {
+    if (!listening || listen_paused || glob_child_pid || restart_profile) {
         return FALSE;
     }
     start_sync((skip_plugins ? SYNC_NO_PLUGINS : 0) | SYNC_BACKGROUND);
@@ -751,6 +754,33 @@ static void set_listening(int on, int save) {
     }
 }
 
+/* Whether a sync has a handheld connected */
+int jpilot_sync_connected(void) {
+    return glob_child_pid && sync_connected;
+}
+
+/* The Handheld Explorer is about to use the port: stop a sync that is only
+ * waiting for a handheld, and do not start waiting again until
+ * jpilot_listen_resume(). */
+void jpilot_listen_pause(void) {
+    listen_paused = TRUE;
+    pending_sync = FALSE;
+    if (listen_timer) {
+        g_source_remove(listen_timer);
+        listen_timer = 0;
+    }
+    if (glob_child_pid && !sync_connected) {
+        kill(glob_child_pid, SIGTERM);
+    }
+}
+
+void jpilot_listen_resume(void) {
+    listen_paused = FALSE;
+    if (listening && !glob_child_pid) {
+        listen_schedule(1);
+    }
+}
+
 static void cb_listen_toggled(GtkCheckMenuItem *item, gpointer data) {
     if (listen_menu_updating) {
         return;
@@ -761,6 +791,9 @@ static void cb_listen_toggled(GtkCheckMenuItem *item, gpointer data) {
 /* After a sync process has gone: run the sync the user asked for while it
  * was waiting, or wait for the next HotSync */
 static void listen_after_sync(int was_connected) {
+    if (listen_paused) {
+        return;
+    }
     if (pending_sync) {
         pending_sync = FALSE;
         start_sync(pending_sync_flags);
@@ -1468,6 +1501,11 @@ static void install_gui_and_size(GtkWidget *main_window) {
     install_gui(main_window, w, h, x, y);
 }
 
+/* File > Handheld Explorer... */
+static void cb_explorer(GtkWidget *widget, gpointer data) {
+    explorer_gui(window);
+}
+
 /* File > Profiles... */
 static void cb_profiles(GtkWidget *widget, gpointer data) {
     gchar *name = profiles_gui(window);
@@ -1624,6 +1662,7 @@ static void get_main_menu(GtkWidget *my_window,
     GtkWidget *sep = gtk_separator_menu_item_new();
     gtk_menu_shell_append(GTK_MENU_SHELL(menu1), sep);
     create_menu_item(menu1, accel_group, "gtk-open", NULL, "Install", GDK_KEY_i, GDK_CONTROL_MASK, cb_install_gui, NULL);
+    create_menu_item(menu1, NULL, "drive-removable-media", NULL, _("Handheld Explorer..."), -1, 0, cb_explorer, NULL);
     create_menu_item(menu1, NULL, "gtk-go-forward", NULL, "Import", -1, GDK_CONTROL_MASK, cb_import, NULL);
     create_menu_item(menu1, NULL, "gtk-go-back", NULL, "Export", -1, GDK_CONTROL_MASK, cb_export, NULL);
     create_menu_item(menu1, accel_group, "gtk-preferences", NULL, "Preferences", GDK_KEY_s, GDK_CONTROL_MASK, cb_prefs_gui, NULL);
@@ -1748,6 +1787,9 @@ static void cb_delete_event(GtkWidget *widget, GdkEvent *event, gpointer data) {
         }
     }
 #endif
+
+    /* End the Handheld Explorer's HotSync session, if any */
+    explorer_shutdown();
 
     if (glob_child_pid) {
         jp_logf(JP_LOG_DEBUG, "killing %d\n", glob_child_pid);

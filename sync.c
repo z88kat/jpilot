@@ -252,7 +252,14 @@ static int sync_spawn_helper(struct my_sync_info *sync_info)
 #endif
 
 #ifdef USE_LOCKING
+static int sync_lock_impl(int *fd, int quiet);
+
 static int sync_lock(int *fd)
+{
+   return sync_lock_impl(fd, FALSE);
+}
+
+static int sync_lock_impl(int *fd, int quiet)
 {
    pid_t pid;
    char lock_file[FILENAME_MAX];
@@ -281,6 +288,10 @@ static int sync_lock(int *fd)
    if (r == -1){
       ssize_t n;
 
+      if (quiet) {
+         close(*fd);
+         return EXIT_FAILURE;
+      }
       jp_logf(JP_LOG_WARN, _("lock failed\n"));
       /* str must be cleared and terminated before atoi(): the file is
        * empty whenever the previous holder truncated it on unlock, and
@@ -365,6 +376,28 @@ static int sync_unlock(int fd)
    return EXIT_SUCCESS;
 }
 #endif
+
+/* The lock that keeps two J-Pilot processes from using the handheld port
+ * at once, for code other than the sync (the Handheld Explorer).  Says
+ * nothing when the port is busy. */
+int jp_port_trylock(int *fd)
+{
+#ifdef USE_LOCKING
+   return sync_lock_impl(fd, TRUE);
+#else
+   *fd = -1;
+   return EXIT_SUCCESS;
+#endif
+}
+
+int jp_port_unlock(int fd)
+{
+#ifdef USE_LOCKING
+   return sync_unlock(fd);
+#else
+   return EXIT_SUCCESS;
+#endif
+}
 
 static const char *get_error_str(int error)
 {
