@@ -152,6 +152,7 @@ static int t_fmt_ampm = TRUE;
    {"expense_sort_order", INTTYPE, INTTYPE, 0, NULL, 0},
    {"keyr_export_filename", CHARTYPE, CHARTYPE, 0, NULL, 0},
    {"external_editor", CHARTYPE, CHARTYPE, 0, NULL, 0},
+   {"backup_on_sync", INTTYPE, INTTYPE, 0, NULL, 0},
 };
 
 

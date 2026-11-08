@@ -127,9 +127,10 @@
 #define PREF_EXPENSE_SORT_ORDER 97
 #define PREF_KEYR_EXPORT_FILENAME 98
 #define PREF_EXTERNAL_EDITOR 99
+#define PREF_BACKUP_ON_SYNC 100
 
 /* Number of preferences in use */
-#define NUM_PREFS 100
+#define NUM_PREFS 101
 /* Maximum number of preferences */
 #define MAX_NUM_PREFS 250
 

@@ -119,7 +119,7 @@ static int sync_connected = FALSE;
  * times, so pressing HotSync on the handheld is enough. */
 #define LISTEN_RESTART_SECS     2  /* pause before waiting again */
 #define LISTEN_QUICK_EXIT_SECS  5  /* a wait shorter than this failed to start */
-#define LISTEN_MAX_QUICK_EXITS  3  /* stop listening after this many in a row */
+#define LISTEN_MAX_QUICK_EXITS  5  /* stop listening after this many in a row */
 static int listening = FALSE;
 static GtkWidget *menu_listen = NULL;
 /* Set while the code itself changes the menu item, so that its "toggled"
@@ -770,14 +770,22 @@ static void listen_after_sync(int was_connected) {
         return;
     }
     if (!was_connected && (time(NULL) - listen_started < LISTEN_QUICK_EXIT_SECS)) {
+        int delay;
+
+        /* For example, the port is busy: a J-Pilot that was force quit
+         * leaves its sync waiting for up to 10 seconds.  Back off (4, 8,
+         * 16, 32 seconds) before giving up. */
         if (++listen_quick_exits >= LISTEN_MAX_QUICK_EXITS) {
             jp_logf(JP_LOG_WARN, _("Stopped listening for HotSync: the sync keeps stopping before a handheld connects.\n"));
             set_listening(FALSE, FALSE);
             return;
         }
-    } else {
-        listen_quick_exits = 0;
+        delay = LISTEN_RESTART_SECS << listen_quick_exits;
+        jp_logf(JP_LOG_GUI, _("The sync stopped before a handheld connected; listening again in %d seconds.\n"), delay);
+        listen_schedule(delay);
+        return;
     }
+    listen_quick_exits = 0;
     listen_schedule(LISTEN_RESTART_SECS);
 }
 

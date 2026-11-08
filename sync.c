@@ -1002,52 +1002,62 @@ static void move_removed_apps(GList *file_list)
    }
 }
 
-static int is_backup_dir(char *name)
+/* Backup directories are named backupYYYYMMDDhhmm.  Before 2.1.2 they were
+ * named backupMMDDhhmm, without the year.  Returns the number of digits
+ * after "backup" (12, or 8 for the old form), or 0 if name is not a backup
+ * directory. */
+static int backup_dir_digits(const char *name)
 {
    int i;
 
-   /* backup dirs are of the form backupMMDDHHMM */
    if (strncmp(name, "backup", 6)) {
-      return FALSE;
-   }
-   for (i=6; i<14; i++) {
-      if (name[i]=='\0') {
-         return FALSE;
-      }
-      if (!isdigit(name[i])) {
-         return FALSE;
-      }
-   }
-   if (name[i]!='\0') {
-      return FALSE;
-   }
-   return TRUE;
-}
-
-static int compare_back_dates(char *s1, char *s2)
-{
-   /* backupMMDDhhmm */
-   int i1, i2;
-
-   if ((strlen(s1) < 8) || (strlen(s2) < 8)) {
       return 0;
    }
-   i1 = atoi(&s1[6]);
-   i2 = atoi(&s2[6]);
-   /* Try to guess the year crossover with a 6 month window */
-   if (((i1/1000000) <= 3) && ((i2/1000000) >= 10)) {
-      return 1;
+   for (i=6; isdigit((unsigned char) name[i]); i++)
+      ;
+   if (name[i] != '\0') {
+      return 0;
    }
-   if (((i1/1000000) >= 10) && ((i2/1000000) <= 3)) {
-      return 2;
+   i -= 6;
+   return ((i == 12) || (i == 8)) ? i : 0;
+}
+
+static int is_backup_dir(char *name)
+{
+   return backup_dir_digits(name) != 0;
+}
+
+/* YYYYMMDDhhmm of a backup directory, to order backups by age.  For the old
+ * names without a year, the year is taken from when the directory was last
+ * changed, which is at or a little after the time in its name.  (Guessing
+ * the year from the month alone, as was done before, could get it wrong
+ * across a long gap between syncs, and then the newest backup was deleted
+ * as the oldest.) */
+static long long backup_dir_age(const char *home_dir, const char *name)
+{
+   char full_name[FILENAME_MAX];
+   struct stat statb;
+   struct tm *changed;
+   long long mmddhhmm, age, changed_age;
+
+   if (backup_dir_digits(name) == 12) {
+      return atoll(name + 6);
    }
-   if (i1>i2) {
-      return 1;
+
+   mmddhhmm = atoll(name + 6);
+   g_snprintf(full_name, sizeof(full_name), "%s/%s", home_dir, name);
+   if (stat(full_name, &statb) || !(changed = localtime(&statb.st_mtime))) {
+      return mmddhhmm;
    }
-   if (i1<i2) {
-      return 2;
+   changed_age = (changed->tm_year + 1900) * 100000000LL +
+                 (changed->tm_mon + 1) * 1000000LL + changed->tm_mday * 10000LL +
+                 changed->tm_hour * 100LL + changed->tm_min;
+   age = (changed->tm_year + 1900) * 100000000LL + mmddhhmm;
+   if (age > changed_age) {
+      /* Named in December, last changed in January */
+      age -= 100000000LL;
    }
-   return 0;
+   return age;
 }
 
 static int sync_remove_r(char *full_path)
@@ -1086,7 +1096,7 @@ static int get_oldest_newest_dir(char *oldest, char *newest, int *count)
    DIR *dir;
    struct dirent *dirent;
    char home_dir[FILENAME_MAX];
-   int r;
+   long long oldest_age = 0, newest_age = 0;
 
    get_home_file_name("", home_dir, sizeof(home_dir));
    jp_logf(JP_LOG_DEBUG, "rotate_backups: opening dir %s\n", home_dir);
@@ -1100,25 +1110,17 @@ static int get_oldest_newest_dir(char *oldest, char *newest, int *count)
    *count = 0;
    while((dirent = readdir(dir))) {
       if (is_backup_dir(dirent->d_name)) {
-         jp_logf(JP_LOG_DEBUG, "backup dir [%s]\n", dirent->d_name);
+         long long age = backup_dir_age(home_dir, dirent->d_name);
+
+         jp_logf(JP_LOG_DEBUG, "backup dir [%s] age %lld\n", dirent->d_name, age);
          (*count)++;
-         if (oldest[0]=='\0') {
+         if ((oldest[0]=='\0') || (age < oldest_age)) {
             strcpy(oldest, dirent->d_name);
-            /* jp_logf(JP_LOG_DEBUG, "oldest is now %s\n", oldest);*/
+            oldest_age = age;
          }
-         if (newest[0]=='\0') {
+         if ((newest[0]=='\0') || (age > newest_age)) {
             strcpy(newest, dirent->d_name);
-            /* jp_logf(JP_LOG_DEBUG, "newest is now %s\n", newest);*/
-         }
-         r = compare_back_dates(oldest, dirent->d_name);
-         if (r==1) {
-            strcpy(oldest, dirent->d_name);
-            /* jp_logf(JP_LOG_DEBUG, "oldest is now %s\n", oldest);*/
-         }
-         r = compare_back_dates(newest, dirent->d_name);
-         if (r==2) {
-            strcpy(newest, dirent->d_name);
-            /* jp_logf(JP_LOG_DEBUG, "newest is now %s\n", newest);*/
+            newest_age = age;
          }
       }
    }
@@ -1170,8 +1172,9 @@ static int sync_rotate_backups(const int num_backups)
    time(&ltime);
    now = localtime(&ltime);
    /* Create the new backup directory */
-   g_snprintf(newdir, sizeof(newdir), "backup%02d%02d%02d%02d",
-              now->tm_mon+1, now->tm_mday, now->tm_hour, now->tm_min);
+   g_snprintf(newdir, sizeof(newdir), "backup%04d%02d%02d%02d%02d",
+              now->tm_year+1900, now->tm_mon+1, now->tm_mday, now->tm_hour, now->tm_min);
+   jp_logf(JP_LOG_GUI, _("Backing up the handheld to %s\n"), newdir);
    if (strncmp(newdir, newest, sizeof(newdir))) {
       g_snprintf(full_newdir, sizeof(full_newdir), "%s/%s", home_dir, newdir);
       if (mkdir(full_newdir, 0700)==0) {
@@ -1637,6 +1640,7 @@ static int sync_fetch(int sd, unsigned int flags,
    int main_app;
    int skip_file;
    int cardno, start;
+   int n_fetched = 0, n_unchanged = 0, n_failed = 0;
    struct DBInfo info;
    char db_copy_name[MAX_DBNAME];
    GList *file_list;
@@ -1684,6 +1688,9 @@ static int sync_fetch(int sd, unsigned int flags,
       { 0, 0, "PMNe", NULL},
       { 0, 0, "ppp_", NULL},
       { 0, 0, "u8EZ", NULL},
+      /* A status database of the Palm OS 5.2.1+ PIM applications (Tungsten
+       * T3 and later) that the handheld never lets a desktop read */
+      { 0, 0, "pdmE", "PIMsSupportStatus-pdmE"},
       { 0, 0, NULL, NULL}
    };
    unsigned int full_backup;
@@ -1894,7 +1901,10 @@ static int sync_fetch(int sd, unsigned int flags,
       /* If modification times are the same then we don't need to fetch it */
       if (info.modifyDate == statb.st_mtime) {
          jp_logf(JP_LOG_DEBUG, "%s up to date, modify date (2) %ld\n", info.name, info.modifyDate);
-         jp_logf(JP_LOG_GUI, _("%s (Creator ID '%s') is up to date, fetch skipped.\n"), db_copy_name, creator);
+         /* Only in the debug log: a backup on every sync would otherwise
+          * list every unchanged database every time */
+         jp_logf(JP_LOG_DEBUG, "%s (Creator ID '%s') is up to date, fetch skipped.\n", db_copy_name, creator);
+         n_unchanged++;
          continue;
       }
 
@@ -1912,8 +1922,10 @@ static int sync_fetch(int sd, unsigned int flags,
          jp_logf(JP_LOG_WARN, _("Failed, unable to back up database %s\n"), info.name);
          times.actime = 0;
          times.modtime = 0;
+         n_failed++;
       } else {
          jp_logf(JP_LOG_GUI, _("OK\n"));
+         n_fetched++;
          times.actime = info.createDate;
          times.modtime = info.modifyDate;
       }
@@ -1935,6 +1947,8 @@ static int sync_fetch(int sd, unsigned int flags,
       if (full_backup) {
          jp_logf(JP_LOG_DEBUG, "Removing apps not found on the palm\n");
          move_removed_apps(file_list);
+         jp_logf(JP_LOG_GUI, _("Backup finished: %d databases fetched, %d unchanged, %d failed.\n"),
+                 n_fetched, n_unchanged, n_failed);
       }
    } else {
       jp_logf(JP_LOG_WARN, "ReadDBList returned = %d\n", r);
@@ -3727,10 +3741,16 @@ static int jp_sync(struct my_sync_info *sync_info)
       }
    }
 
-   jp_logf(JP_LOG_GUI, "****************************************\n");
-   jp_logf(JP_LOG_GUI, _(" Syncing on device %s\n"), device);
-   jp_logf(JP_LOG_GUI, _(" Press the HotSync button now\n"));
-   jp_logf(JP_LOG_GUI, "****************************************\n");
+   if (SYNC_BACKGROUND & sync_info->flags) {
+      /* Listening for HotSync: this is printed after every sync, so keep
+       * it short and leave the previous sync's messages in view */
+      jp_logf(JP_LOG_GUI, _("Waiting for HotSync on %s...\n"), device);
+   } else {
+      jp_logf(JP_LOG_GUI, "****************************************\n");
+      jp_logf(JP_LOG_GUI, _(" Syncing on device %s\n"), device);
+      jp_logf(JP_LOG_GUI, _(" Press the HotSync button now\n"));
+      jp_logf(JP_LOG_GUI, "****************************************\n");
+   }
 
    ret = jp_pilot_connect(&sd, device);
    if (ret) {
@@ -3750,7 +3770,15 @@ static int jp_sync(struct my_sync_info *sync_info)
    /* Sync into the profile of the handheld that connected.  This can
     * change the preferences, so the database names are chosen after it. */
    if (!(SYNC_RESTORE & sync_info->flags)) {
+      long backup_on_sync;
+
       sync_select_profile(sd, sync_info);
+
+      /* The profile synced into may want a backup with every sync */
+      get_pref(PREF_BACKUP_ON_SYNC, &backup_on_sync, NULL);
+      if (backup_on_sync && !(SYNC_FULL_BACKUP & sync_info->flags)) {
+         sync_info->flags |= SYNC_FULL_BACKUP;
+      }
    }
 
    /* Convert to new database names if prefs set */

@@ -567,6 +567,10 @@ void cb_prefs_gui(GtkWidget *widget, gpointer data) {
                      "changed", G_CALLBACK(cb_backups_entry),
                      NULL);
 
+    /* Back up on every sync, not only with the Backup button */
+    add_checkbutton(_("Back up the handheld on every sync (default NO)"),
+                    PREF_BACKUP_ON_SYNC, vbox_settings, cb_checkbox_set_pref);
+
 	if (!glob_sqlite) {
 		/* Show deleted files check box */
 		add_checkbutton(_("Show deleted records (default NO)"),
