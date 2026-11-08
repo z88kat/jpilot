@@ -825,6 +825,12 @@ static void listen_after_sync(int was_connected) {
 static void cb_sync(GtkWidget *widget, unsigned int flags) {
     long ivalue;
 
+    if (explorer_is_open()) {
+        /* It has the handheld port */
+        jp_logf(JP_LOG_WARN, _("The Handheld Explorer is using the handheld. Disconnect it first, then sync.\n"));
+        return;
+    }
+
     /* confirm file installation */
     get_pref(PREF_CONFIRM_FILE_INSTALL, &ivalue, NULL);
     if (ivalue) {
