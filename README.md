@@ -150,6 +150,14 @@ With **File -> Listen for HotSync** turned on, J-Pilot is always waiting for a h
 
 On macOS the sync runs in a separate `jpilot-sync` process, so J-Pilot stays responsive while it waits for the handheld.
 
+### Handheld Explorer
+**File -> Handheld Explorer...** opens a window for looking at what is on the handheld and moving things on and off it, without syncing.  Press HotSync on the handheld to connect; the connection stays open until you click Disconnect or close the window.
+
+- **Internal memory** lists the databases and applications with their type, creator, size, number of records and date, and shows the free memory.  *Copy to Computer* saves them as `.pdb`/`.prc`/`.pqa` files.  Databases that just hold a file are saved as that file: the Photos application keeps each picture as one, so `3.jpg` comes out as a real JPEG.  *Copy to Handheld* installs `.prc`, `.pdb` and `.pqa` files.  *Delete* removes databases from the handheld; take care with the ones the handheld itself uses.
+- **Memory cards** (Palm OS 4 and later) can be browsed folder by folder.  Files and whole folders can be copied to the computer, files copied into the current folder of the card, folders made, and files and folders deleted.
+
+Files copied to the computer never replace files already there, and keep the dates they have on the handheld.  While the explorer is open, listening for HotSync is paused.  Always end with Disconnect (or by closing the window or J-Pilot): a handheld whose connection disappears without that may hang on its sync screen until it is reset.
+
 ### BACKUP and SYNC
 The Sync button syncs the 4 applications with the palm pilot and any plugins that are installed.  By default a sync DOES NOT back up your palm.
 
