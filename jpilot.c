@@ -909,13 +909,34 @@ void output_to_pane(const char *str) {
         ivalue = size_requisition.height + 1;
         set_pref(PREF_OUTPUT_HEIGHT, ivalue, NULL, TRUE);
     }
-    //w = gdk_window_get_width(gtk_widget_get_window(window));
-    /* window may not be realized yet if a message is logged during GUI
+    /* Show at least ivalue pixels of output.  The view above the pane does
+     * not shrink below its minimum height, and with larger themes (macOS)
+     * that can be the whole window, which left the pane 1 pixel high.  Then
+     * make the window taller instead.  A pane the user has made larger is
+     * left alone.
+     * The window may not be realized yet if a message is logged during GUI
      * construction (before gtk_widget_show_all); get_window() is NULL then. */
-    h = gtk_widget_get_window(window) ?
-        gdk_window_get_height(gtk_widget_get_window(window)) : 0;
-    new_y = h - ivalue;
-    gtk_paned_set_position(GTK_PANED(output_pane), new_y);
+    if (gtk_widget_get_window(window)) {
+        GtkWidget *top = gtk_paned_get_child1(GTK_PANED(output_pane));
+        int top_min = 0;
+
+        gtk_widget_get_preferred_height(top, &top_min, NULL);
+        h = gtk_widget_get_allocated_height(output_pane);
+        if (h <= 1) {
+            h = gdk_window_get_height(gtk_widget_get_window(window));
+        }
+        if (h - gtk_paned_get_position(GTK_PANED(output_pane)) < ivalue) {
+            if (h - top_min < ivalue) {
+                int win_w, win_h, grow = ivalue - (h - top_min);
+
+                gtk_window_get_size(GTK_WINDOW(window), &win_w, &win_h);
+                gtk_window_resize(GTK_WINDOW(window), win_w, win_h + grow);
+                h += grow;
+            }
+            new_y = h - ivalue;
+            gtk_paned_set_position(GTK_PANED(output_pane), new_y);
+        }
+    }
 
     /* Output text to window */
     GtkTextIter end_iter;
@@ -1771,11 +1792,18 @@ static gint cb_output_idle(gpointer data) {
 }
 
 static gint cb_output2(GtkWidget *widget, GdkEventButton *event, gpointer data) {
+    /* Only when the divider itself was dragged.  Button releases anywhere
+     * in the window bubble up to the pane, and recording the size then
+     * saved the height of a closed pane (1 pixel) as the user's choice. */
+    if (event->window != gtk_paned_get_handle_window(GTK_PANED(widget))) {
+        return FALSE;
+    }
+
     /* Because the pane isn't redrawn yet we can't get positions from it.
      * So we have to call back after everything is drawn */
     g_idle_add(cb_output_idle, data);
 
-    return EXIT_SUCCESS;
+    return FALSE;
 }
 
 static gint cb_check_version(gpointer main_window) {
