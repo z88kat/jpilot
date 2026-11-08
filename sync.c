@@ -825,8 +825,9 @@ static int jp_pilot_connect(int *Psd, const char *device)
        * On timeout the libusb backend returns 0, but the macOS (Darwin
        * IOKit) backend returns PI_ERR_SOCK_TIMEOUT.  Neither means the
        * port is broken, so treat both as "nothing connected yet" and keep
-       * waiting.  pi_accept_to() has already closed the socket in the
-       * PI_ERR_SOCK_TIMEOUT case. */
+       * waiting.  pi_accept_to() closes the socket when it returns an
+       * error, but not when it returns 0, so close it here then; otherwise
+       * a socket is leaked every slice. */
       ret = pi_accept_to(sd, 0, 0, SYNC_ACCEPT_SLICE_SECS);
       if (ret > 0) {
          sd = ret;
@@ -835,6 +836,8 @@ static int jp_pilot_connect(int *Psd, const char *device)
 
       if (ret == PI_ERR_SOCK_TIMEOUT) {
          ret = 0;
+      } else if (ret == 0) {
+         pi_close(sd);
       }
 
       if (ret < 0) {
@@ -848,8 +851,7 @@ static int jp_pilot_connect(int *Psd, const char *device)
          return SYNC_ERROR_PI_ACCEPT;
       }
 
-      /* Timed out with no handheld.  pi_accept_to() has closed the socket
-       * for us, so do not close it again here.
+      /* Timed out with no handheld; the socket has been closed.
        *
        * Check the bus after every slice, not just the first: the handheld
        * only appears there once HotSync is pressed, which may well be
