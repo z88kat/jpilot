@@ -196,7 +196,8 @@ int load_plugins(void)
       closedir(dir);
    }
 
-   get_home_file_name("plugins/", path, sizeof(path));
+   /* Plugins the user installed are shared by all profiles */
+   profile_base_file_name("plugins/", path, sizeof(path));
    cleanup_path(path);
    jp_logf(JP_LOG_DEBUG, "opening dir %s\n", path);
    dir = opendir(path);

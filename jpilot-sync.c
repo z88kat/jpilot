@@ -61,7 +61,7 @@ void cb_cancel_sync(GtkWidget *widget, unsigned int flags) { return; }
 /****************************** Main Code *************************************/
 static void fprint_jps_usage_string(FILE *out)
 {
-   fprintf(out, "%s-sync [ -v || -h || [-d] [-P] [-b] [-l] [-p port] ]\n", EPN);
+   fprintf(out, "%s-sync [ -v || -h || [-d] [-P] [-b] [-l] [-p port] [--profile name] ]\n", EPN);
    fprintf(out, "%s", _(" J-Pilot preferences are read to get sync info such as port, rate, number of backups, etc.\n"));
    fprintf(out, "%s", _(" -v display version and compile options\n"));
    fprintf(out, "%s", _(" -h display help text\n"));
@@ -70,6 +70,8 @@ static void fprint_jps_usage_string(FILE *out)
    fprintf(out, "%s", _(" -b sync, and then do a backup\n"));
    fprintf(out, "%s", _(" -l loop, otherwise sync once and exit\n"));
    fprintf(out, "%s", _(" -p {port} use this port to sync on instead of default\n"));
+   fprintf(out, "%s", _(" --profile {name} sync into this profile (created if it does not exist);\n"
+                        "   without it the profile J-Pilot last used is synced\n"));
 }
 
 static void sig_handler(int sig)
@@ -119,6 +121,18 @@ int main(int argc, char *argv[])
    bindtextdomain(EPN, LOCALEDIR);
    textdomain(EPN);
 #endif
+
+   /* Pick the profile before the preferences are read from it */
+   {
+      char profile_name[PROFILE_NAME_MAX + 1];
+      int have_profile_arg;
+
+      have_profile_arg = profile_take_arg(&argc, argv, profile_name,
+                                          sizeof(profile_name));
+      if (profile_startup(profile_name, have_profile_arg)) {
+         exit(1);
+      }
+   }
 
    port[0]='\0';
    glob_child_pid=0;

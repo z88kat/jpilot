@@ -816,6 +816,31 @@ void output_to_pane(const char *str) {
 }
 
 
+/* "J-Pilot 2.1.1 User: name", followed by the profile unless it is the
+ * default one */
+static void build_window_title(char *title, size_t size) {
+    long char_set;
+    const char *svalue;
+
+    get_pref(PREF_CHAR_SET, &char_set, NULL);
+    get_pref(PREF_USER, NULL, &svalue);
+
+    g_strlcpy(title, PN" "VERSION, size);
+    if ((svalue) && (svalue[0])) {
+        /* Convert user name so that it can be displayed in window title */
+        /* We assume user name is coded in jpilot.rc as it is on the Palm Pilot */
+        char *user_name = charset_p2newj(svalue, -1, char_set);
+
+        g_strlcat(title, _(" User: "), size);
+        g_strlcat(title, user_name, size);
+        free(user_name);
+    }
+    if (profile_get_active()[0]) {
+        g_strlcat(title, _("   Profile: "), size);
+        g_strlcat(title, profile_get_active(), size);
+    }
+}
+
 const char * pipe_command_to_text(int command) {
     switch (command) {
     case PIPE_PRINT:
@@ -852,10 +877,7 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
     int command;
     char user[MAX_PREF_LEN];
     char command_str[80];
-    long char_set;
-    const char *svalue;
     char title[MAX_PREF_LEN + 256];
-    char *user_name;
     gint in = g_io_channel_unix_get_fd(channel);
     const char *cmd_str;
 
@@ -997,16 +1019,8 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
                     break;
                 case PIPE_FINISHED:
                     /* Update main window title as user name may have changed */
-                    get_pref(PREF_CHAR_SET, &char_set, NULL);
-                    get_pref(PREF_USER, NULL, &svalue);
-                    strcpy(title, PN" "VERSION);
-                    if ((svalue) && (svalue[0])) {
-                        strcat(title, _(" User: "));
-                        user_name = charset_p2newj(svalue, -1, char_set);
-                        strcat(title, user_name);
-                        gtk_window_set_title(GTK_WINDOW(window), title);
-                        free(user_name);
-                    }
+                    build_window_title(title, sizeof(title));
+                    gtk_window_set_title(GTK_WINDOW(window), title);
                     /* And redraw GUI */
                     if (Pstr1) {
                         cb_app_button(NULL, GINT_TO_POINTER(REDRAW));
@@ -1566,6 +1580,16 @@ int main(int argc, char *argv[]) {
 #endif
     int pid;
     int remote_sync = FALSE;
+    char profile_name[PROFILE_NAME_MAX + 1];
+    int have_profile_arg;
+
+    /* Pick the profile first: everything below, including the log file,
+     * lives in the profile's directory.  getopt() does not know about
+     * --profile, so it is taken out of argv here. */
+    have_profile_arg = profile_take_arg(&argc, argv, profile_name, sizeof(profile_name));
+    if (profile_startup(profile_name, have_profile_arg)) {
+        exit(1);
+    }
 
     skip_plugins = FALSE;
     skip_past_alarms = FALSE;
@@ -1796,6 +1820,9 @@ int main(int argc, char *argv[]) {
         write_pid();
     }
 
+    /* Open this profile again next time */
+    profile_set_last(profile_get_active());
+
     /* Check to see if DB files are there */
     /* If not copy some empty ones over */
     if (!glob_sqlite) check_copy_DBs_to_home();
@@ -1882,21 +1909,7 @@ int main(int argc, char *argv[]) {
 
     read_gtkrc_file();
 
-    get_pref(PREF_USER, NULL, &svalue);
-
-    strcpy(title, PN" "VERSION);
-    if ((svalue) && (svalue[0])) {
-        strcat(title, _(" User: "));
-        /* Convert user name so that it can be displayed in window title */
-        /* We assume user name is coded in jpilot.rc as it is on the Palm Pilot */
-        {
-            char *newvalue;
-
-            newvalue = charset_p2newj(svalue, -1, char_set);
-            strcat(title, newvalue);
-            free(newvalue);
-        }
-    }
+    build_window_title(title, sizeof(title));
 
     window = gtk_widget_new(GTK_TYPE_WINDOW,
                             "type", GTK_WINDOW_TOPLEVEL,

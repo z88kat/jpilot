@@ -622,7 +622,7 @@ int check_hidden_dir(void) {
         /* Directory isn't there, create it.
        * Only user is given permission to enter and change directory contents
        * which provides some primitive privacy protection. */
-        if (mkdir(hidden_dir, 0700)) {
+        if (g_mkdir_with_parents(hidden_dir, 0700)) {
             /* Can't create directory */
             jp_logf(JP_LOG_WARN, _("Can't create directory %s\n"), hidden_dir);
             return EXIT_FAILURE;
@@ -1859,7 +1859,7 @@ int forward_backward_in_ce_time(const struct CalendarEvent *cale,
 
 /* Displays usage string on supplied file handle */
 void fprint_usage_string(FILE *out) {	// only called from jpilot.c
-    fprintf(out, "%s [ -v || -h || [-d] [-p] [-a || -A] [-r] [-S] [-s] [-i] [-g] ]\n", EPN);
+    fprintf(out, "%s [ -v || -h || [-d] [-p] [-a || -A] [-r] [-S] [-s] [-i] [-g] [--profile name] ]\n", EPN);
     fprintf(out, "%s", _(" -v display version and compile options\n"));
     fprintf(out, "%s", _(" -h display help text\n"));
     fprintf(out, "%s", _(" -d display debug info to stdout\n"));
@@ -1870,7 +1870,9 @@ void fprint_usage_string(FILE *out) {	// only called from jpilot.c
     fprintf(out, "%s", _(" -S store data in SQLite database\n"));
     fprintf(out, "%s", _(" -s start sync using existing instance of GUI\n"));
     fprintf(out, "%s", _(" -i iconify program immediately after launch\n"));
-    fprintf(out, "%s", _(" -g {X geometry} use specified geometry for main window\n\n"));
+    fprintf(out, "%s", _(" -g {X geometry} use specified geometry for main window\n"));
+    fprintf(out, "%s", _(" --profile {name} use this profile (created if it does not exist);\n"
+                         "   \"Default\" is ~/.jpilot itself.  Without it the last profile used is opened.\n\n"));
     fprintf(out, "%s", _(" The PILOTPORT and PILOTRATE environment variables specify\n"));
     fprintf(out, "%s", _(" which port to sync on, and at what speed.\n"));
     fprintf(out, "%s", _(" If PILOTPORT is not set then it defaults to /dev/pilot.\n"));
@@ -2050,29 +2052,19 @@ int get_highlighted_today(struct tm *date) {
     return now_tm->tm_mday;
 }
 
-/* creates the full path name of a file in the ~/.jpilot dir */
+/* Creates the full path name of a file in the active profile's directory:
+ * ~/.jpilot/ for the default profile, ~/.jpilot/profiles/<name>/ otherwise.
+ * ($JPILOT_HOME replaces ~ when it is set.) */
 int get_home_file_name(const char *file, char *full_name, int max_size) {
-    char *home, default_path[] = ".";
+    char dir[FILENAME_MAX];
 
-#ifdef ENABLE_PROMETHEON
-    home = getenv("COPILOT_HOME");
-#else
-    home = getenv("JPILOT_HOME");
-#endif
-    if (!home) {/* No JPILOT_HOME var */
-        home = getenv("HOME");
-        if (!home) {/* No HOME var */
-            fprintf(stderr, _("Can't get HOME environment variable\n"));
-        }
-    }
-    if (!home) {
-        home = default_path;
-    }
-    if (strlen(home) > (max_size - strlen(file) - strlen("/."EPN"/") - 2)) {
+    profile_dir(profile_get_active(), dir, sizeof(dir));
+    if (strlen(dir) + strlen(file) + 1 > (size_t) max_size) {
         fprintf(stderr, _("HOME environment variable is too long to process\n"));
-        home = default_path;
+        g_snprintf(full_name, max_size, "./."EPN"/%s", file);
+        return EXIT_FAILURE;
     }
-    sprintf(full_name, "%s/."EPN"/%s", home, file);
+    g_snprintf(full_name, max_size, "%s%s", dir, file);
     return EXIT_SUCCESS;
 }
 
@@ -3296,7 +3288,7 @@ int get_rcfile_name(int n, char *rc_copy)
          * for the prefix <EPN>rc ("jpilotrc"), the name used by the GTK2
          * gtkrc themes, so no theme kept here was ever listed even
          * though read_gtkrc_file() will happily load one. */
-        get_home_file_name("", full_name, sizeof(full_name));
+        profile_base_file_name("", full_name, sizeof(full_name));
         if (add_rcfiles_from_dir(full_name) != EXIT_SUCCESS) {
             return EXIT_FAILURE;
         }

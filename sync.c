@@ -179,7 +179,7 @@ static gchar *sync_find_helper(void)
 static int sync_spawn_helper(struct my_sync_info *sync_info)
 {
    gchar *helper;
-   gchar *argv[24];
+   gchar *argv[26];
    gchar fd_out[16], fd_in[16], flags_str[16];
    gchar user_id_str[32], pc_id_str[32], backups_str[16];
    GError *error = NULL;
@@ -218,6 +218,9 @@ static int sync_spawn_helper(struct my_sync_info *sync_info)
    argv[argc++] = pc_id_str;
    argv[argc++] = "--backups";
    argv[argc++] = backups_str;
+   argv[argc++] = "--profile";
+   argv[argc++] = profile_get_active()[0] ? (gchar *) profile_get_active()
+                                          : PROFILE_DEFAULT_LABEL;
    if (glob_log_stdout_mask & JP_LOG_DEBUG) {
       argv[argc++] = "-d";
    }
@@ -256,7 +259,8 @@ static int sync_lock(int *fd)
    struct flock lock;
 #endif
 
-   get_home_file_name("sync_pid", lock_file, sizeof(lock_file));
+   /* Shared by all profiles: they all use the same handheld port */
+   profile_base_file_name("sync_pid", lock_file, sizeof(lock_file));
    *fd = open(lock_file, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
    if (*fd<0) {
       jp_logf(JP_LOG_WARN, _("open lock file failed\n"));
@@ -317,7 +321,8 @@ static int sync_unlock(int fd)
    struct flock lock;
 #endif
 
-   get_home_file_name("sync_pid", lock_file, sizeof(lock_file));
+   /* Shared by all profiles: they all use the same handheld port */
+   profile_base_file_name("sync_pid", lock_file, sizeof(lock_file));
 
 #ifndef USE_FLOCK
    lock.l_type = F_UNLCK;

@@ -39,6 +39,7 @@
 #include "japanese.h"
 #include "cp1250.h"
 #include "russian.h"
+#include "profile.h"
 
 #define PRINT_FILE_LINE printf("%s line %d\n", __FILE__, __LINE__)
 
