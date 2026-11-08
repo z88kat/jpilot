@@ -2,7 +2,7 @@
 .SH NAME
 jpilot \- A palm pilot desktop for Linux/Unix
 .SH SYNOPSIS
-.B jpilot [-v] [-h] [-d] [-A] [-a] [-i] [-p] [-r] [-S] [-s]
+.B jpilot [-v] [-h] [-d] [-A] [-a] [-i] [-p] [-r] [-S] [-s] [--profile name]
 .SH "DESCRIPTION"
 J-Pilot is a desktop organizer application for the palm pilot and other
 Palm OS devices.  It is similar in functionality to the one that
@@ -42,6 +42,13 @@ instance.
 .TP
 .B \-S
 store data in SQLite database.
+.TP
+.BI "\-\-profile " name
+open this profile, creating it if it does not exist.  Each profile keeps
+the data of one handheld.
+.B Default
+is ~/.jpilot itself; other profiles are kept in ~/.jpilot/profiles/.
+Without this option the profile used last is opened.
 
 If you have more than one 
 .B jpilot 
