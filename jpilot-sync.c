@@ -103,6 +103,7 @@ int main(int argc, char *argv[])
    int flags;
    int r, i;
    int loop;
+   int helper;
    char port[MAX_PREF_LEN];
 #ifdef ENABLE_PLUGINS
    struct plugin_s *plugin;
@@ -122,6 +123,7 @@ int main(int argc, char *argv[])
    port[0]='\0';
    glob_child_pid=0;
    loop=0;
+   helper=0;
    skip_plugins=0;
 
    flags = SYNC_NO_FORK;
@@ -141,6 +143,43 @@ int main(int argc, char *argv[])
 
    /* Parse command line options */
    for (i=1; i<argc; i++) {
+      /* Options used when J-Pilot starts this program to perform a sync
+       * for it (see sync_spawn_helper() in sync.c).  They are not meant to
+       * be typed by hand. */
+      if (!strcmp(argv[i], "--helper") && (i+2 < argc)) {
+         helper = 1;
+         /* Share the log file of the J-Pilot that started us.  Set this
+          * before anything is logged, which would open it. */
+         glob_log_file_append = 1;
+         pipe_to_parent = atoi(argv[++i]);
+         pipe_from_parent = atoi(argv[++i]);
+         continue;
+      }
+      if (!strcmp(argv[i], "--flags") && (i+1 < argc)) {
+         flags |= (unsigned int) strtoul(argv[++i], NULL, 10);
+         continue;
+      }
+      if (!strcmp(argv[i], "--port") && (i+1 < argc)) {
+         g_strlcpy(port, argv[++i], MAX_PREF_LEN);
+         set_pref(PREF_PORT, 0, port, FALSE);
+         continue;
+      }
+      if (!strcmp(argv[i], "--user") && (i+1 < argc)) {
+         set_pref(PREF_USER, 0, argv[++i], FALSE);
+         continue;
+      }
+      if (!strcmp(argv[i], "--user-id") && (i+1 < argc)) {
+         set_pref(PREF_USER_ID, strtol(argv[++i], NULL, 10), NULL, FALSE);
+         continue;
+      }
+      if (!strcmp(argv[i], "--pc-id") && (i+1 < argc)) {
+         set_pref(PREF_PC_ID, strtol(argv[++i], NULL, 10), NULL, FALSE);
+         continue;
+      }
+      if (!strcmp(argv[i], "--backups") && (i+1 < argc)) {
+         set_pref(PREF_NUM_BACKUPS, strtol(argv[++i], NULL, 10), NULL, FALSE);
+         continue;
+      }
       if (!strncasecmp(argv[i], "-v", 2)) {
          char options[1024];
          get_compile_options(options, sizeof(options));
@@ -178,6 +217,22 @@ int main(int argc, char *argv[])
       }
    }
 
+   if (helper) {
+      /* Behave like a forked sync child: no looping, plugins as the GUI
+       * asked, and GUI messages go to the parent over the pipe instead of
+       * to stdout. */
+      flags |= SYNC_NO_FORK | SYNC_HELPER;
+      loop = 0;
+      if (flags & SYNC_NO_PLUGINS) {
+         skip_plugins = 1;
+      }
+      glob_log_gui_mask = JP_LOG_FATAL | JP_LOG_WARN | JP_LOG_GUI;
+      if (glob_log_stdout_mask != 0xFFFF) {
+         glob_log_stdout_mask = JP_LOG_INFO | JP_LOG_WARN | JP_LOG_FATAL |
+                                JP_LOG_STDOUT;
+      }
+   }
+
 #ifdef ENABLE_PLUGINS
    if (!skip_plugins) {
       load_plugins();
@@ -210,6 +265,10 @@ int main(int argc, char *argv[])
 
    do {
       r = setup_sync(flags);
+      if (helper) {
+         /* The parent GUI has already been told what happened */
+         break;
+      }
       switch (r) {
        case 0:
          /* sync successful */

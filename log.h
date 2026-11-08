@@ -42,6 +42,7 @@
 #define PIPE_SYNC_CANCEL     201
 
 extern int glob_log_file_mask;
+extern int glob_log_file_append;
 extern int glob_log_stdout_mask;
 extern int glob_log_gui_mask;
 

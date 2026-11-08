@@ -30,6 +30,10 @@
 #define SYNC_NO_FORK       0x08
 #define SYNC_RESTORE       0x10
 #define SYNC_INSTALL_USER  0x20
+/* Set in a jpilot-sync process that the GUI started to perform its sync.
+ * It does not fork, but it has a parent that can answer questions over the
+ * pipes. */
+#define SYNC_HELPER        0x40
 
 #define SYNC_ERROR_BIND            -10
 #define SYNC_ERROR_LISTEN          -11

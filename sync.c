@@ -34,6 +34,10 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <limits.h>
+#ifdef __APPLE__
+#  include <mach-o/dyld.h>
+#endif
 #ifdef USE_FLOCK
 #  include <sys/file.h>
 #else
@@ -71,6 +75,10 @@
  * obvious problem, then going back to waiting (seconds). */
 #define SYNC_ACCEPT_SLICE_SECS 10
 
+/* How long a sync that runs inside the GUI process waits for the handheld
+ * before giving up (seconds).  The GUI cannot respond while it waits. */
+#define SYNC_IN_GUI_MAX_WAIT_SECS 30
+
 #ifndef min
 #  define min(a,b) (((a) < (b)) ? (a) : (b))
 #endif
@@ -83,6 +91,7 @@
 /******************************* Global vars **********************************/
 extern int pipe_to_parent, pipe_from_parent;
 extern pid_t glob_child_pid;
+extern pid_t jpilot_master_pid;
 
 /****************************** Prototypes ************************************/
 /* From jpilot.c for restoring sync icon after successful sync */
@@ -117,6 +126,124 @@ static void on_sync_child_exit(GPid pid, gint status, gpointer data)
    glob_child_pid = 0;
    cb_cancel_sync(NULL, 0);
 }
+
+/* Whether a question (for example "this is a different handheld, sync
+ * anyway?") can be put to a parent GUI over the pipes.  A forked child and
+ * the sync helper have one; jpilot-sync run from a shell, and a sync that
+ * runs inside the GUI process itself, do not. */
+static int sync_can_ask_parent(unsigned int flags)
+{
+   return !(SYNC_NO_FORK & flags) || (SYNC_HELPER & flags);
+}
+
+#ifdef __APPLE__
+/* Find the jpilot-sync program that sits next to the running jpilot, so
+ * that a jpilot run from the build directory uses the jpilot-sync built
+ * with it.  Falls back to searching $PATH.  Returns a newly allocated path,
+ * or NULL. */
+static gchar *sync_find_helper(void)
+{
+   char exe_path[PATH_MAX];
+   char real_path[PATH_MAX];
+   uint32_t size = sizeof(exe_path);
+
+   if ((_NSGetExecutablePath(exe_path, &size) == 0) &&
+       (realpath(exe_path, real_path) != NULL)) {
+      gchar *dir = g_path_get_dirname(real_path);
+      gchar *candidate = g_build_filename(dir, EPN"-sync", NULL);
+
+      g_free(dir);
+      if (g_file_test(candidate, G_FILE_TEST_IS_EXECUTABLE)) {
+         return candidate;
+      }
+      g_free(candidate);
+   }
+
+   return g_find_program_in_path(EPN"-sync");
+}
+
+/*
+ * Start the sync in a separate jpilot-sync process instead of forking.
+ *
+ * On macOS a child that is forked from a process which has used
+ * CoreFoundation (GTK's Quartz backend has) must exec() before it uses
+ * CoreFoundation itself, and pilot-link's IOKit USB code does.  J-Pilot
+ * used to work around this ("bug 1924") by syncing inside the GUI process,
+ * which froze the window until the handheld connected.
+ *
+ * The helper talks to us over the same pipes and protocol a forked child
+ * uses, so the rest of the GUI does not know the difference.  The sync
+ * parameters are passed on the command line because the GUI may change
+ * the preferences again as soon as this returns (Install User does).
+ */
+static int sync_spawn_helper(struct my_sync_info *sync_info)
+{
+   gchar *helper;
+   gchar *argv[24];
+   gchar fd_out[16], fd_in[16], flags_str[16];
+   gchar user_id_str[32], pc_id_str[32], backups_str[16];
+   GError *error = NULL;
+   GPid pid;
+   int argc = 0;
+
+   helper = sync_find_helper();
+   if (!helper) {
+      jp_logf(JP_LOG_WARN, _("Unable to find %s\n"), EPN"-sync");
+      return EXIT_FAILURE;
+   }
+
+   /* The helper reads the rest of the preferences from the rc file */
+   pref_write_rc_file();
+
+   g_snprintf(fd_out, sizeof(fd_out), "%d", pipe_to_parent);
+   g_snprintf(fd_in, sizeof(fd_in), "%d", pipe_from_parent);
+   g_snprintf(flags_str, sizeof(flags_str), "%u", sync_info->flags);
+   g_snprintf(user_id_str, sizeof(user_id_str), "%ld", sync_info->userID);
+   g_snprintf(pc_id_str, sizeof(pc_id_str), "%ld", sync_info->PC_ID);
+   g_snprintf(backups_str, sizeof(backups_str), "%u", sync_info->num_backups);
+
+   argv[argc++] = helper;
+   argv[argc++] = "--helper";
+   argv[argc++] = fd_out;
+   argv[argc++] = fd_in;
+   argv[argc++] = "--flags";
+   argv[argc++] = flags_str;
+   argv[argc++] = "--port";
+   argv[argc++] = sync_info->port;
+   argv[argc++] = "--user";
+   argv[argc++] = sync_info->username;
+   argv[argc++] = "--user-id";
+   argv[argc++] = user_id_str;
+   argv[argc++] = "--pc-id";
+   argv[argc++] = pc_id_str;
+   argv[argc++] = "--backups";
+   argv[argc++] = backups_str;
+   if (glob_log_stdout_mask & JP_LOG_DEBUG) {
+      argv[argc++] = "-d";
+   }
+   argv[argc] = NULL;
+
+   jp_logf(JP_LOG_DEBUG, "starting sync helper %s\n", helper);
+
+   /* Leave the descriptors open so the helper inherits the pipe ends it
+    * was told about. */
+   if (!g_spawn_async(NULL, argv, NULL,
+                      G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_LEAVE_DESCRIPTORS_OPEN,
+                      NULL, NULL, &pid, &error)) {
+      jp_logf(JP_LOG_WARN, _("Unable to start %s: %s\n"), helper,
+              error ? error->message : "?");
+      g_clear_error(&error);
+      g_free(helper);
+      return EXIT_FAILURE;
+   }
+   g_free(helper);
+
+   glob_child_pid = pid;
+   g_child_watch_add(pid, on_sync_child_exit, NULL);
+
+   return EXIT_SUCCESS;
+}
+#endif
 
 #ifdef USE_LOCKING
 static int sync_lock(int *fd)
@@ -630,9 +757,19 @@ static int jp_pilot_connect(int *Psd, const char *device)
    int sd;
    int ret;
    int logged_wait = 0;
+   int waited = 0;
+   int max_wait = 0;
    struct  SysInfo sys_info;
 
    *Psd=0;
+
+   /* A sync running inside the GUI process blocks the GUI until the
+    * handheld connects, so do not wait forever there.  Everywhere else
+    * (forked child, jpilot-sync, the sync helper) waiting is harmless and
+    * can be cancelled. */
+   if (getpid() == jpilot_master_pid) {
+      max_wait = SYNC_IN_GUI_MAX_WAIT_SECS;
+   }
 
    /* Wait for the handheld in slices instead of forever.  Each time a slice
     * passes with nothing connecting we get a chance to look for a problem
@@ -736,6 +873,14 @@ static int jp_pilot_connect(int *Psd, const char *device)
             jp_logf(JP_LOG_WARN, _("See %s\n"), JP_PERMISSIONS_URL);
             return SYNC_ERROR_PI_ACCEPT;
          }
+      }
+
+      waited += SYNC_ACCEPT_SLICE_SECS;
+      if (max_wait && (waited >= max_wait)) {
+         jp_logf(JP_LOG_WARN,
+                 _("No handheld connected within %d seconds, giving up.\n"),
+                 waited);
+         return SYNC_ERROR_PI_ACCEPT;
       }
 
       /* Only say this once, however long the user takes to press HotSync. */
@@ -3447,7 +3592,7 @@ static int jp_sync(struct my_sync_info *sync_info)
       jp_logf(JP_LOG_GUI, _(" This Username-->\"%s\"\n"), U.username);
       jp_logf(JP_LOG_GUI, _(" This User ID-->%d\n"), U.userID);
 
-      if (SYNC_NO_FORK & sync_info->flags) {
+      if (!sync_can_ask_parent(sync_info->flags)) {
          return SYNC_ERROR_NULL_USERID;
       } else {
          write_to_parent(PIPE_WAITING_ON_USER, "%d:\n", SYNC_ERROR_NULL_USERID);
@@ -3469,7 +3614,7 @@ static int jp_sync(struct my_sync_info *sync_info)
       jp_logf(JP_LOG_GUI, _(" This Username-->\"%s\"\n"), U.username);
       jp_logf(JP_LOG_GUI, _(" This User ID-->%d\n"), U.userID);
 
-      if (SYNC_NO_FORK & sync_info->flags) {
+      if (!sync_can_ask_parent(sync_info->flags)) {
          return SYNC_ERROR_NOT_SAME_USERID;
       } else {
          write_to_parent(PIPE_WAITING_ON_USER, "%d:\n", SYNC_ERROR_NOT_SAME_USERID);
@@ -3489,10 +3634,10 @@ static int jp_sync(struct my_sync_info *sync_info)
       jp_logf(JP_LOG_GUI, _("Last Synced UserID-->\"%d\"\n"), sync_info->userID);
       jp_logf(JP_LOG_GUI, _(" This Username-->\"%s\"\n"), U.username);
       jp_logf(JP_LOG_GUI, _(" This User ID-->%d\n"), U.userID);
-      write_to_parent(PIPE_WAITING_ON_USER, "%d:\n", SYNC_ERROR_NOT_SAME_USER);
-      if (SYNC_NO_FORK & sync_info->flags) {
+      if (!sync_can_ask_parent(sync_info->flags)) {
          return SYNC_ERROR_NOT_SAME_USER;
       } else {
+         write_to_parent(PIPE_WAITING_ON_USER, "%d:\n", SYNC_ERROR_NOT_SAME_USER);
          ret = wait_for_response(sd);
       }
 
@@ -3722,11 +3867,6 @@ int sync_once(struct my_sync_info *sync_info)
    struct my_sync_info sync_info_copy;
    pid_t pid;
 
-#ifdef __APPLE__
-   /* bug 1924 */
-   sync_info->flags |= SYNC_NO_FORK;
-#endif
-
    /* This should never be reached with new cancel sync code
     * Although, it can be reached through a remote sync. */
    if (glob_child_pid) {
@@ -3736,6 +3876,19 @@ int sync_once(struct my_sync_info *sync_info)
                              "         or stop the sync by typing \"kill %d\" at the command line\n"), PN, glob_child_pid);
       return EXIT_FAILURE;
    }
+
+#ifdef __APPLE__
+   /* A forked child cannot use the macOS USB code (bug 1924), so run the
+    * sync in a helper process.  If that is not possible, sync inside this
+    * process as J-Pilot used to; the GUI is unresponsive while it does. */
+   if (!(SYNC_NO_FORK & sync_info->flags)) {
+      if (sync_spawn_helper(sync_info) == EXIT_SUCCESS) {
+         return EXIT_SUCCESS;
+      }
+      jp_logf(JP_LOG_WARN, _("Syncing inside %s instead; it will not respond until the sync is finished.\n"), PN);
+      sync_info->flags |= SYNC_NO_FORK;
+   }
+#endif
 
    /* Make a copy of the sync info for the forked process */
    memcpy(&sync_info_copy, sync_info, sizeof(struct my_sync_info));
