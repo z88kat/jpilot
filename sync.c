@@ -3392,9 +3392,11 @@ static int fast_sync_application(char *DB_name, int sd)
 }
 
 /* Set when this sync moved to another profile, or detected the databases
- * of a profile's first handheld.  The parent GUI has stale preferences for
- * that profile then, so this process saves them itself. */
+ * of a profile's first handheld: the profile now belongs to this handheld
+ * and its preferences have changed. */
 static int sync_saves_identity = FALSE;
+/* Set when this sync moved to another profile than the GUI has open */
+static int sync_switched_profile = FALSE;
 
 static long sync_new_pc_id(void)
 {
@@ -3439,6 +3441,7 @@ static void sync_switch_profile(const char *name, struct my_sync_info *sync_info
    }
 
    sync_saves_identity = TRUE;
+   sync_switched_profile = TRUE;
    write_to_parent(PIPE_PROFILE, "\"%s\"\n", name);
 }
 
@@ -3496,6 +3499,7 @@ static void sync_select_profile(int sd, struct my_sync_info *sync_info)
    const char *target = NULL;
 
    sync_saves_identity = FALSE;
+   sync_switched_profile = FALSE;
 
    if (getpid() == jpilot_master_pid) {
       /* Syncing inside the GUI process; switching would pull the GUI's own
@@ -3557,11 +3561,27 @@ static void sync_select_profile(int sd, struct my_sync_info *sync_info)
       sync_info->userID = U.userID;
       set_pref(PREF_USER, 0, U.username, FALSE);
       set_pref(PREF_USER_ID, U.userID, NULL, FALSE);
-      if (!target) {
-         /* Same profile, newly detected databases: the GUI must reload it */
+
+      if (sync_switched_profile || (pipe_to_parent == STDOUT_FILENO)) {
+         /* No GUI has this profile open, so nothing else writes its rc
+          * file */
+         pref_write_rc_file();
+      } else {
+         /* The GUI has this profile open and rewrites the whole rc file
+          * whenever it saves a preference, so it must be the one to save
+          * these.  It gets the user name and ID with PIPE_USERNAME and
+          * PIPE_USERID as usual; then it reloads the profile. */
+         long datebook_version, address_version, todo_version, memo_version;
+
+         get_pref(PREF_DATEBOOK_VERSION, &datebook_version, NULL);
+         get_pref(PREF_ADDRESS_VERSION, &address_version, NULL);
+         get_pref(PREF_TODO_VERSION, &todo_version, NULL);
+         get_pref(PREF_MEMO_VERSION, &memo_version, NULL);
+         write_to_parent(PIPE_DB_VERSIONS, "%ld %ld %ld %ld\n",
+                         datebook_version, address_version,
+                         todo_version, memo_version);
          write_to_parent(PIPE_PROFILE, "\"%s\"\n", profile_get_active());
       }
-      pref_write_rc_file();
    }
 }
 

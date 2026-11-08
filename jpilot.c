@@ -953,12 +953,14 @@ void output_to_pane(const char *str) {
 }
 
 
+/* Whether the sync under way works in another profile than this one; its
+ * user name, ID and password then belong to that profile, which the sync
+ * process saves itself. */
+static int sync_is_for_other_profile(void) {
+    return sync_profile && strcmp(sync_profile, profile_get_active());
+}
+
 static gboolean cb_restart_into_profile(gpointer data) {
-    /* The sync saved the settings of the profile it worked in.  If that is
-     * this profile, quitting must not overwrite them with ours. */
-    if (!strcmp(restart_profile, profile_get_active())) {
-        glob_rc_file_write = 0;
-    }
     /* Shut down as if the window was closed; main() then restarts */
     cb_delete_event(window, NULL, NULL);
     return FALSE;
@@ -1047,6 +1049,8 @@ const char * pipe_command_to_text(int command) {
         return "PROFILE";
     case PIPE_CONNECTED:
         return "CONNECTED";
+    case PIPE_DB_VERSIONS:
+        return "DB_VERSIONS";
     default:
         return "UNKNOWN";
     }
@@ -1139,7 +1143,7 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
                     output_to_pane(Pstr1);
                     break;
                 case PIPE_USERID:
-                    if (sync_profile) {
+                    if (sync_is_for_other_profile()) {
                         /* The sync process saved it in its profile */
                         break;
                     }
@@ -1153,7 +1157,7 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
                     }
                     break;
                 case PIPE_USERNAME:
-                    if (sync_profile) {
+                    if (sync_is_for_other_profile()) {
                         break;
                     }
                     /* Save username as pref */
@@ -1173,7 +1177,7 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
                     }
                     break;
                 case PIPE_PASSWORD:
-                    if (sync_profile) {
+                    if (sync_is_for_other_profile()) {
                         break;
                     }
                     /* Save password as pref */
@@ -1222,6 +1226,19 @@ gboolean cb_read_pipe_from_child(GIOChannel *channel, GIOCondition cond, gpointe
                 case PIPE_CONNECTED:
                     sync_connected = TRUE;
                     break;
+                case PIPE_DB_VERSIONS: {
+                    long versions[4];
+
+                    /* The databases of this profile's first handheld */
+                    if (sscanf(Pstr1, "%ld %ld %ld %ld", &versions[0], &versions[1],
+                               &versions[2], &versions[3]) == 4) {
+                        set_pref(PREF_DATEBOOK_VERSION, versions[0], NULL, FALSE);
+                        set_pref(PREF_ADDRESS_VERSION, versions[1], NULL, FALSE);
+                        set_pref(PREF_TODO_VERSION, versions[2], NULL, FALSE);
+                        set_pref(PREF_MEMO_VERSION, versions[3], NULL, TRUE);
+                    }
+                    break;
+                }
                 case PIPE_PROFILE:
                     Pstr2 = strchr(Pstr1, '\"');
                     Pstr3 = Pstr2 ? strchr(Pstr2 + 1, '\"') : NULL;

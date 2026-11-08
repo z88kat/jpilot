@@ -40,6 +40,7 @@
 #define PIPE_FINISHED        105
 #define PIPE_PROFILE         106  /* the sync moved to, or changed, this profile */
 #define PIPE_CONNECTED       107  /* a handheld connected; the sync is under way */
+#define PIPE_DB_VERSIONS     108  /* datebook, address, todo and memo versions detected */
 #define PIPE_SYNC_CONTINUE   200
 #define PIPE_SYNC_CANCEL     201
 
