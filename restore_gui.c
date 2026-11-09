@@ -31,6 +31,7 @@
 
 #include "i18n.h"
 #include "utils.h"
+#include "jpilot.h"
 #include "prefs.h"
 #include "sync.h"
 #include "log.h"
@@ -114,7 +115,10 @@ static void cb_restore_ok(GtkWidget *widget, gpointer data) {
         }
     }
 
-    setup_sync(SYNC_NO_PLUGINS | SYNC_OVERRIDE_USER | SYNC_RESTORE);
+    if (jpilot_prepare_menu_sync()) {
+        setup_sync(SYNC_NO_PLUGINS | SYNC_OVERRIDE_USER | SYNC_RESTORE);
+        jpilot_menu_sync_started();
+    }
 
     gtk_widget_destroy(data);
 }

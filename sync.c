@@ -3583,6 +3583,10 @@ static void sync_select_profile(int sd, struct my_sync_info *sync_info)
        ((unsigned long) sync_info->userID != U.userID)) {
       if (profile_find_by_user_id(U.userID, match, sizeof(match))) {
          target = match;
+      } else if (((sync_info->userID != 0) || sync_info->username[0]) &&
+                 profile_find_unbound_named(U.username, match, sizeof(match))) {
+         /* A profile made in advance for this handheld, by its user name */
+         target = match;
       } else if ((sync_info->userID != 0) || sync_info->username[0]) {
          profile_make_unique_name(U.username, new_name, sizeof(new_name));
          if (profile_create(new_name, profile_get_active()) == EXIT_SUCCESS) {

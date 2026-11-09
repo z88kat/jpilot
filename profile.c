@@ -387,17 +387,14 @@ int profile_find_by_user_id(unsigned long user_id, char *name, int max_size)
    return found;
 }
 
-void profile_make_unique_name(const char *wanted, char *name, int max_size)
+/* A valid profile name made from wanted: the characters a profile name may
+ * not contain become '_', leaving room for a " 99" suffix */
+static void profile_name_from(const char *wanted, char *base, int max_size)
 {
-   char base[PROFILE_NAME_MAX + 1];
-   char candidate[PROFILE_NAME_MAX + 1];
    const char *p;
    int len = 0;
-   int n;
 
-   /* Keep the characters a profile name may contain, leaving room for a
-    * " 99" suffix */
-   for (p = wanted ? wanted : ""; *p && (len < PROFILE_NAME_MAX - 3); p++) {
+   for (p = wanted ? wanted : ""; *p && (len < PROFILE_NAME_MAX - 3) && (len < max_size - 1); p++) {
       if (g_ascii_isalnum(*p) || strchr(" _-.+", *p)) {
          base[len++] = *p;
       } else {
@@ -410,9 +407,32 @@ void profile_make_unique_name(const char *wanted, char *name, int max_size)
       memmove(base, base + 1, strlen(base));
    }
    if (!profile_name_is_valid(base)) {
-      g_strlcpy(base, "Handheld", sizeof(base));
+      g_strlcpy(base, "Handheld", max_size);
    }
+}
 
+int profile_find_unbound_named(const char *wanted, char *name, int max_size)
+{
+   char base[PROFILE_NAME_MAX + 1];
+   unsigned long user_id;
+
+   profile_name_from(wanted, base, sizeof(base));
+   if (!profile_exists(base) ||
+       (profile_read_identity(base, NULL, 0, &user_id) != EXIT_SUCCESS) ||
+       (user_id != 0)) {
+      return FALSE;
+   }
+   g_strlcpy(name, base, max_size);
+   return TRUE;
+}
+
+void profile_make_unique_name(const char *wanted, char *name, int max_size)
+{
+   char base[PROFILE_NAME_MAX + 1];
+   char candidate[PROFILE_NAME_MAX + 1];
+   int n;
+
+   profile_name_from(wanted, base, sizeof(base));
    g_strlcpy(candidate, base, sizeof(candidate));
    for (n = 2; profile_exists(candidate) && (n < 100); n++) {
       g_snprintf(candidate, sizeof(candidate), "%s %d", base, n);
