@@ -99,6 +99,11 @@ int profile_find_by_user_id(unsigned long user_id, char *name, int max_size);
  * user name). */
 void profile_make_unique_name(const char *wanted, char *name, int max_size);
 
+/* If the profile that a handheld whose user is wanted would be named after
+ * exists and has never been synced, return TRUE and its name.  So a profile
+ * made in advance for a handheld is used for it. */
+int profile_find_unbound_named(const char *wanted, char *name, int max_size);
+
 /* Remove "--profile NAME" or "--profile=NAME" from argv.  Returns TRUE and
  * the name if it was there. */
 int profile_take_arg(int *argc, char *argv[], char *name, int max_size);

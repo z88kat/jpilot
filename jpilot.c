@@ -129,8 +129,11 @@ static int listen_menu_updating = FALSE;
 static guint listen_timer = 0;
 static time_t listen_started = 0;
 static int listen_quick_exits = 0;
-/* Listening is paused while the Handheld Explorer uses the port */
+/* Listening is paused while the Handheld Explorer uses the port, and while
+ * a sync started from a menu runs */
 static int listen_paused = FALSE;
+/* Listen again once the sync started from a menu has finished */
+static int resume_listen_after_sync = FALSE;
 /* A Sync or Backup the user asked for while a sync was waiting */
 static int pending_sync = FALSE;
 static unsigned int pending_sync_flags = 0;
@@ -781,6 +784,50 @@ void jpilot_listen_resume(void) {
     }
 }
 
+int jpilot_prepare_menu_sync(void) {
+    gint64 until;
+
+    if (explorer_is_open()) {
+        jp_logf(JP_LOG_WARN, _("The Handheld Explorer is using the handheld. Disconnect it first, then try again.\n"));
+        return FALSE;
+    }
+    if (glob_child_pid && sync_connected) {
+        jp_logf(JP_LOG_WARN, _("A HotSync is in progress; try again when it has finished.\n"));
+        return FALSE;
+    }
+    if (!glob_child_pid && !listening) {
+        return TRUE;
+    }
+
+    /* Stop the sync waiting for a handheld, and wait until it has gone:
+     * the caller's setup_sync() refuses to start while it is there */
+    jpilot_listen_pause();
+    until = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+    while (glob_child_pid && (g_get_monotonic_time() < until)) {
+        g_main_context_iteration(NULL, FALSE);
+        g_usleep(20000);
+    }
+    if (glob_child_pid) {
+        jp_logf(JP_LOG_WARN, _("The waiting sync did not stop; try again.\n"));
+        jpilot_listen_resume();
+        return FALSE;
+    }
+    /* Set only now, so the exit of the sync just stopped does not count */
+    resume_listen_after_sync = listening;
+    return TRUE;
+}
+
+void jpilot_menu_sync_started(void) {
+    if (glob_child_pid) {
+        gtk_widget_hide(button_sync);
+        gtk_widget_show(button_cancel_sync);
+    } else if (resume_listen_after_sync) {
+        /* It did not start: listen again now */
+        resume_listen_after_sync = FALSE;
+        jpilot_listen_resume();
+    }
+}
+
 static void cb_listen_toggled(GtkCheckMenuItem *item, gpointer data) {
     if (listen_menu_updating) {
         return;
@@ -1040,6 +1087,12 @@ void sync_child_exited(void) {
     int was_connected = sync_connected;
 
     sync_connected = FALSE;
+
+    if (resume_listen_after_sync) {
+        /* The sync started from a menu has finished */
+        resume_listen_after_sync = FALSE;
+        listen_paused = FALSE;
+    }
 
     if (sync_profile) {
         if (strcmp(sync_profile, profile_get_active())) {

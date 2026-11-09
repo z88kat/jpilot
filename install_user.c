@@ -262,7 +262,12 @@ int install_user_gui(GtkWidget *main_window)
       jp_logf(JP_LOG_DEBUG, "user is %s\n", user);
       jp_logf(JP_LOG_DEBUG, "user id is %ld\n", user_id);
       
-      r = setup_sync(SYNC_NO_PLUGINS | SYNC_INSTALL_USER);
+      if (jpilot_prepare_menu_sync()) {
+         r = setup_sync(SYNC_NO_PLUGINS | SYNC_INSTALL_USER);
+         jpilot_menu_sync_started();
+      } else {
+         r = EXIT_FAILURE;
+      }
 
       jp_logf(JP_LOG_DEBUG, "old user is %s\n", old_user);
       jp_logf(JP_LOG_DEBUG, "old user id is %ld\n", old_user_id);

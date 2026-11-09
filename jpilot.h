@@ -22,3 +22,11 @@
 void cb_monthview_quit(GtkWidget *widget, gpointer data);
 void cb_weekview_quit(GtkWidget *widget, gpointer data);
 
+/* For a sync started from a menu (Install User, Restore Handheld) rather
+ * than with Sync or Backup.  Call jpilot_prepare_menu_sync() before
+ * setup_sync(): it stops a sync that is only waiting for a handheld, so
+ * that this one can start, and returns FALSE if it cannot start now.  Call
+ * jpilot_menu_sync_started() after setup_sync(). */
+int jpilot_prepare_menu_sync(void);
+void jpilot_menu_sync_started(void);
+
