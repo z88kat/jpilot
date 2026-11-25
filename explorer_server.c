@@ -819,6 +819,153 @@ static int worker_file_to_card(int sd, int volref, const char *dir,
    return r;
 }
 
+/* Make a folder on a card.  One that is already there is fine: what is
+ * copied into it is merged with what it holds. */
+static int card_make_dir(int sd, int volref, const char *path, char **error)
+{
+   unsigned long attr = 0;
+   FileRef ref;
+   int r, r2;
+
+   r = dlp_VFSDirCreate(sd, volref, path);
+   if ((r >= 0) || connection_lost(r)) {
+      if (r < 0) *error = error_text(sd, r);
+      return r;
+   }
+   /* Before anything else is asked, which resets the error */
+   *error = error_text(sd, r);
+   r2 = dlp_VFSFileOpen(sd, volref, path, dlpVFSOpenRead, &ref);
+   if (connection_lost(r2)) {
+      return r2;
+   }
+   if (r2 >= 0) {
+      r2 = dlp_VFSFileGetAttributes(sd, ref, &attr);
+      dlp_VFSFileClose(sd, ref);
+      if ((r2 >= 0) && (attr & vfsFileAttrDirectory)) {
+         g_clear_pointer(error, g_free);
+         return 0;
+      }
+      if (r2 >= 0) {
+         g_free(*error);
+         *error = g_strdup(_("a file of that name is in the way"));
+      }
+   }
+   return r;
+}
+
+static int is_palm_db_name(const char *name)
+{
+   char *lower = g_ascii_strdown(name, -1);
+   int yes = g_str_has_suffix(lower, ".prc") || g_str_has_suffix(lower, ".pdb") ||
+             g_str_has_suffix(lower, ".pqa");
+
+   g_free(lower);
+   return yes;
+}
+
+typedef struct {
+   int ok;
+   int failed;
+   int skipped;           /* not Palm databases, in folders for internal memory */
+   GString *failures;
+} copy_count_t;
+
+static gint compare_names(gconstpointer a, gconstpointer b)
+{
+   return g_utf8_collate(*(const char **) a, *(const char **) b);
+}
+
+/* Copy a local file or folder to the handheld.  To a card, a folder is
+ * copied with everything in it.  To internal memory, the applications and
+ * databases in a folder and its subfolders are installed, and the rest is
+ * skipped.  shown is the name in messages.  Returns a negative number only
+ * if the connection has gone; other failures are counted. */
+static int worker_to_handheld(int sd, int volref, const char *dir, const char *local_path,
+                              const char *shown, int depth, copy_count_t *count)
+{
+   int internal = (volref == EXPLORER_INTERNAL_MEMORY);
+   char *error = NULL;
+   int r = 0;
+
+   if (g_file_test(local_path, G_FILE_TEST_IS_DIR)) {
+      char *base = g_path_get_basename(local_path);
+      char *card_dir = internal ? NULL : explorer_card_path(dir, base);
+      GPtrArray *names = g_ptr_array_new_with_free_func(g_free);
+      const char *name;
+      GError *gerror = NULL;
+      GDir *gdir;
+      unsigned int i;
+
+      g_free(base);
+      if (depth >= MAX_DEPTH) {
+         error = g_strdup(_("folders are nested too deeply"));
+         r = -1;
+      } else if (card_dir) {
+         post_progress(_("Creating %s..."), card_dir);
+         r = card_make_dir(sd, volref, card_dir, &error);
+      }
+      if (r >= 0) {
+         gdir = g_dir_open(local_path, 0, &gerror);
+         if (!gdir) {
+            error = g_strdup(gerror->message);
+            g_error_free(gerror);
+            r = -1;
+         } else {
+            while ((name = g_dir_read_name(gdir))) {
+               /* Hidden files: .DS_Store, ._ resource forks and the like */
+               if (name[0] != '.') {
+                  g_ptr_array_add(names, g_strdup(name));
+               }
+            }
+            g_dir_close(gdir);
+            g_ptr_array_sort(names, compare_names);
+         }
+      }
+      for (i = 0; (r >= 0) && (i < names->len); i++) {
+         char *child = g_build_filename(local_path, g_ptr_array_index(names, i), NULL);
+         char *child_shown = g_strdup_printf("%s/%s", shown, (char *) g_ptr_array_index(names, i));
+
+         r = worker_to_handheld(sd, volref, card_dir, child, child_shown, depth + 1, count);
+         g_free(child);
+         g_free(child_shown);
+      }
+      g_ptr_array_unref(names);
+      g_free(card_dir);
+   } else if (internal) {
+      struct pi_file *pf;
+
+      if ((depth > 0) && !is_palm_db_name(local_path)) {
+         count->skipped++;
+         return 0;
+      }
+      post_progress(_("Installing %s..."), shown);
+      pf = pi_file_open(local_path);
+      if (!pf) {
+         error = g_strdup(_("not a Palm database or application"));
+         r = -1;
+      } else {
+         r = pi_file_install(pf, sd, 0, NULL);
+         if (r < 0) error = error_text(sd, r);
+         pi_file_close(pf);
+      }
+      if (r >= 0) count->ok++;
+   } else if (g_file_test(local_path, G_FILE_TEST_IS_REGULAR)) {
+      post_progress(_("Copying %s..."), shown);
+      r = worker_file_to_card(sd, volref, dir, local_path, &error);
+      if (r >= 0) count->ok++;
+   } else {
+      /* A socket, a broken link or the like: nothing to copy */
+      return 0;
+   }
+
+   if (error) {
+      count->failed++;
+      g_string_append_printf(count->failures, "\n%s: %s", shown, error);
+      g_free(error);
+   }
+   return connection_lost(r) ? r : 0;
+}
+
 /* Delete a file, or a folder and everything in it, from a card */
 static int worker_card_delete(int sd, int volref, const char *dir,
                               const explorer_item_t *item, int depth, char **error)
@@ -899,40 +1046,38 @@ static int worker_handle(int sd, request_t *req)
          copied, req->target);
       break;
 
-    case REQ_TO_HANDHELD:
-      for (i = 0; i < req->paths->len; i++) {
+    case REQ_TO_HANDHELD: {
+      copy_count_t count = { 0, 0, 0, failures };
+
+      for (i = 0; (r >= 0) && (i < req->paths->len); i++) {
          const char *path = g_ptr_array_index(req->paths, i);
          char *base = g_path_get_basename(path);
 
-         post_progress(_("Copying %s to the handheld (%u of %u)..."), base, i + 1, req->paths->len);
-         if (req->volref == EXPLORER_INTERNAL_MEMORY) {
-            struct pi_file *pf = pi_file_open(path);
-
-            if (!pf) {
-               error = g_strdup(_("not a Palm database or application"));
-               r = -1;
-            } else {
-               r = pi_file_install(pf, sd, 0, NULL);
-               if (r < 0) error = error_text(sd, r);
-               pi_file_close(pf);
-            }
-         } else {
-            r = worker_file_to_card(sd, req->volref, req->dir, path, &error);
-         }
-         if (r < 0) {
-            failed++;
-            g_string_append_printf(failures, "\n%s: %s", base, error ? error : "?");
-         } else {
-            ok++;
-         }
-         g_clear_pointer(&error, g_free);
+         r = worker_to_handheld(sd, req->volref, req->dir, path, base, 0, &count);
          g_free(base);
-         if (connection_lost(r)) break;
       }
-      res->message = g_strdup_printf(
-         g_dngettext(NULL, "Copied %d item to the handheld.", "Copied %d items to the handheld.", ok), ok);
+      failed = count.failed;
+      if (req->volref == EXPLORER_INTERNAL_MEMORY) {
+         res->message = g_strdup_printf(
+            g_dngettext(NULL, "Installed %d application or database.",
+                        "Installed %d applications and databases.", count.ok), count.ok);
+      } else {
+         res->message = g_strdup_printf(
+            g_dngettext(NULL, "Copied %d file to the handheld.",
+                        "Copied %d files to the handheld.", count.ok), count.ok);
+      }
+      if (count.skipped) {
+         char *more = g_strdup_printf(
+            g_dngettext(NULL, "%s  Skipped %d file that is not a Palm application or database.",
+                        "%s  Skipped %d files that are not Palm applications or databases.",
+                        count.skipped), res->message, count.skipped);
+
+         g_free(res->message);
+         res->message = more;
+      }
       res->refresh = TRUE;
       break;
+    }
 
     case REQ_DELETE:
       for (i = 0; i < req->items->len; i++) {

@@ -150,7 +150,7 @@ typedef struct {
    GtkListStore *list_store;
    GtkWidget *path_label;
    GtkWidget *message_label;
-   GtkWidget *btn_to_computer, *btn_to_handheld, *btn_mkdir, *btn_delete;
+   GtkWidget *btn_to_computer, *btn_to_handheld, *btn_folder_to_handheld, *btn_mkdir, *btn_delete;
    GtkWidget *btn_up, *btn_refresh, *btn_disconnect;
    GtkTreeViewColumn *col_type, *col_creator, *col_records;
 
@@ -304,6 +304,7 @@ static void update_buttons(void)
 
    gtk_widget_set_sensitive(ex->btn_to_computer, ready && selected);
    gtk_widget_set_sensitive(ex->btn_to_handheld, ready);
+   gtk_widget_set_sensitive(ex->btn_folder_to_handheld, ready);
    gtk_widget_set_sensitive(ex->btn_delete, ready && selected);
    gtk_widget_set_sensitive(ex->btn_mkdir, ready && card);
    gtk_widget_set_sensitive(ex->btn_up, ready && card && ex->dir && strcmp(ex->dir, "/"));
@@ -884,15 +885,67 @@ static int confirm(const char *primary, const char *secondary, const char *butto
    return answer == GTK_RESPONSE_ACCEPT;
 }
 
+/* Copy what was chosen on this computer (files or folders) to the
+ * location shown.  Frees files. */
+static void copy_to_handheld(GSList *files)
+{
+   GSList *f;
+   GPtrArray *paths;
+   GString *replaced = g_string_new(NULL);
+   int n_replaced = 0, folders = FALSE;
+   request_t *req;
+
+   if (!files || !ex) {
+      g_slist_free_full(files, g_free);
+      g_string_free(replaced, TRUE);
+      return;
+   }
+
+   paths = g_ptr_array_new_with_free_func(g_free);
+   for (f = files; f; f = f->next) {
+      char *base = g_path_get_basename(f->data);
+      int is_dir = g_file_test(f->data, G_FILE_TEST_IS_DIR);
+
+      if (is_dir || g_file_test(f->data, G_FILE_TEST_IS_REGULAR)) {
+         g_ptr_array_add(paths, g_strdup(f->data));
+         if ((ex->volref != EXPLORER_INTERNAL_MEMORY) && listed(base)) {
+            n_replaced++;
+            folders |= is_dir;
+            g_string_append_printf(replaced, "%s\n", base);
+         }
+      }
+      g_free(base);
+   }
+   g_slist_free_full(files, g_free);
+   g_free(last_local_dir);
+   last_local_dir = (paths->len) ? g_path_get_dirname(g_ptr_array_index(paths, 0)) : NULL;
+
+   if (folders) {
+      g_string_append(replaced, _("\nFolders are merged with the folder of the same name; "
+                                  "files in them with the same name are replaced."));
+   }
+   if (!paths->len ||
+       (n_replaced && !confirm(_("Replace the items of the same name on the card?"),
+                               replaced->str, _("_Replace")))) {
+      g_ptr_array_unref(paths);
+      g_string_free(replaced, TRUE);
+      return;
+   }
+   g_string_free(replaced, TRUE);
+
+   req = g_new0(request_t, 1);
+   req->type = REQ_TO_HANDHELD;
+   req->volref = ex->volref;
+   req->dir = g_strdup(ex->dir);
+   req->paths = paths;
+   send_request(req);
+}
+
 static void cb_to_handheld(GtkWidget *widget, gpointer data)
 {
    GtkWidget *chooser;
    GtkFileFilter *filter;
-   GSList *files = NULL, *f;
-   GPtrArray *paths;
-   GString *replaced = g_string_new(NULL);
-   int n_replaced = 0;
-   request_t *req;
+   GSList *files = NULL;
 
    chooser = gtk_file_chooser_dialog_new(_("Copy to the Handheld"), GTK_WINDOW(ex->window),
                                          GTK_FILE_CHOOSER_ACTION_OPEN,
@@ -919,44 +972,32 @@ static void cb_to_handheld(GtkWidget *widget, gpointer data)
       files = gtk_file_chooser_get_filenames(GTK_FILE_CHOOSER(chooser));
    }
    gtk_widget_destroy(chooser);
-   if (!files || !ex) {
-      g_slist_free_full(files, g_free);
-      g_string_free(replaced, TRUE);
-      return;
+   copy_to_handheld(files);
+}
+
+/* The file chooser cannot pick files and folders in the same dialog, so
+ * folders have their own */
+static void cb_folder_to_handheld(GtkWidget *widget, gpointer data)
+{
+   GtkWidget *chooser;
+   GSList *files = NULL;
+   int internal = (ex->volref == EXPLORER_INTERNAL_MEMORY);
+
+   chooser = gtk_file_chooser_dialog_new(internal ? _("Install the Applications in a Folder")
+                                                  : _("Copy a Folder to the Handheld"),
+                                         GTK_WINDOW(ex->window),
+                                         GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
+                                         _("_Cancel"), GTK_RESPONSE_CANCEL,
+                                         internal ? _("_Install") : _("_Copy"),
+                                         GTK_RESPONSE_ACCEPT, NULL);
+   gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(chooser), TRUE);
+   gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(chooser),
+                                       last_local_dir ? last_local_dir : g_get_home_dir());
+   if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT) {
+      files = gtk_file_chooser_get_filenames(GTK_FILE_CHOOSER(chooser));
    }
-
-   paths = g_ptr_array_new_with_free_func(g_free);
-   for (f = files; f; f = f->next) {
-      char *base = g_path_get_basename(f->data);
-
-      if (g_file_test(f->data, G_FILE_TEST_IS_REGULAR)) {
-         g_ptr_array_add(paths, g_strdup(f->data));
-         if ((ex->volref != EXPLORER_INTERNAL_MEMORY) && listed(base)) {
-            n_replaced++;
-            g_string_append_printf(replaced, "%s\n", base);
-         }
-      }
-      g_free(base);
-   }
-   g_slist_free_full(files, g_free);
-   g_free(last_local_dir);
-   last_local_dir = (paths->len) ? g_path_get_dirname(g_ptr_array_index(paths, 0)) : NULL;
-
-   if (!paths->len ||
-       (n_replaced && !confirm(_("Replace the files of the same name on the card?"),
-                               replaced->str, _("_Replace")))) {
-      g_ptr_array_unref(paths);
-      g_string_free(replaced, TRUE);
-      return;
-   }
-   g_string_free(replaced, TRUE);
-
-   req = g_new0(request_t, 1);
-   req->type = REQ_TO_HANDHELD;
-   req->volref = ex->volref;
-   req->dir = g_strdup(ex->dir);
-   req->paths = paths;
-   send_request(req);
+   gtk_widget_destroy(chooser);
+   copy_to_handheld(files);
 }
 
 static void cb_delete(GtkWidget *widget, gpointer data)
@@ -1273,6 +1314,11 @@ static void build_window(GtkWidget *main_window)
                                     _("Install applications and databases (.prc, .pdb, .pqa) in internal memory, "
                                       "or copy files into this folder of the card"),
                                     G_CALLBACK(cb_to_handheld));
+   ex->btn_folder_to_handheld = add_button(buttons, _("Copy F_older to Handheld..."),
+                                           _("Copy folders, with everything in them, into this folder "
+                                             "of the card, or install the applications and databases "
+                                             "in them in internal memory"),
+                                           G_CALLBACK(cb_folder_to_handheld));
    ex->btn_mkdir = add_button(buttons, _("_New Folder..."),
                               _("Make a folder in this folder of the card"),
                               G_CALLBACK(cb_mkdir));
